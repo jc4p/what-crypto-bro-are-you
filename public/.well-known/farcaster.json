@@ -1,0 +1,17 @@
+{
+  "accountAssociation": {
+    "header": "eyJmaWQiOjk3NzIzMywidHlwZSI6ImN1c3RvZHkiLCJrZXkiOiIweGE2N0JhMDI4MTIzMWVCOUUyZWE0Y0Y5Nzg5NGMwYjBiNUI4MDFDYzYifQ",
+    "payload": "eyJkb21haW4iOiJ3aGF0LWNyeXB0by1icm8ua2FzcmEuY29kZXMifQ",
+    "signature": "MHhhNTRjZGRmNzEwODk4ZTI1YTI2MjZjYjJiYWRjNDhiZDY1Mzg4MTEzYWM3YjQ3OGE0ZmFlMjYzNjk0ZDRmNjc5MmFjZTkwOGM5NjFhMDVkMmU4Y2QxNDJiNWJmY2JlNGYzOTMyOGJkNWEzZDlmMjRmNjIwOGI4OWRiNTY2ZjhhYjFj"
+  },
+  "frame": {
+    "version": "1",
+    "name": "What Crypto Bro Are You?",
+    "iconUrl": "https://cover-art.kasra.codes/bro_square.png",
+    "homeUrl": "https://what-crypto-bro.kasra.codes",
+    "imageUrl": "https://cover-art.kasra.codes/bro_rectangle.png",
+    "buttonTitle": "Find out now!",
+    "splashImageUrl": "https://cover-art.kasra.codes/bro_square.png",
+    "splashBackgroundColor": "#ffffff"
+  }
+}
