@@ -1,0 +1,2896 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+4. Repository files, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+<additional_info>
+
+</additional_info>
+
+</file_summary>
+
+<directory_structure>
+src/
+  do/
+    mockup_queue.js
+    session.js
+  routes/
+    admin.js
+    imageUtils.js
+    protected.js
+    public.js
+    webhooks.js
+    websockets.js
+  auth.js
+  index.js
+  printful.js
+  scheduled.js
+  seed.js
+tests/
+  designs.test.js
+  products.test.js
+.editorconfig
+.gitignore
+.prettierrc
+local_schema.sql
+package.json
+schema.sql
+wrangler.toml
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="src/do/mockup_queue.js">
+// api/src/do/mockup_queue.js
+
+// Placeholder for Mockup Generation Queue Durable Object
+// Will accept jobs, store them, and potentially process them or call external APIs (like Printful mockup API)
+
+export class MockupQueueDurableObject {
+    constructor(state, env) {
+        this.state = state;
+        this.env = env;
+        this.printfulApiKey = env.PRINTFUL_API_KEY;
+        this.db = env.DB;
+    }
+
+    async fetch(request) {
+        const url = new URL(request.url);
+
+        if (url.pathname === '/queue' && request.method === 'POST') {
+            return this.handleQueueRequest(request);
+        }
+
+        return new Response('Not found', { status: 404 });
+    }
+
+    async handleQueueRequest(request) {
+        if (!this.printfulApiKey) {
+            console.error('[DO MockupQueue] PRINTFUL_API_KEY not set in environment.');
+            return new Response('Internal Server Error: Printful API Key missing', { status: 500 });
+        }
+        if (!this.db) {
+            console.error('[DO MockupQueue] DB binding not available.');
+            return new Response('Internal Server Error: Database binding missing', { status: 500 });
+        }
+
+        let taskData;
+        try {
+            taskData = await request.json();
+            if (!taskData.designId || !taskData.imageUrl || !taskData.variantId) {
+                throw new Error('Missing required fields: designId, imageUrl, variantId');
+            }
+        } catch (e) {
+            console.error('[DO MockupQueue] Failed to parse task data:', e);
+            return new Response(`Bad Request: ${e.message}`, { status: 400 });
+        }
+
+        const { designId, imageUrl, variantId } = taskData;
+        console.log(`[DO MockupQueue] Received task for design ${designId}`);
+
+        try {
+            // 1. Get Printful Variant ID from DB
+            const variantInfo = await this.db.prepare(
+                `SELECT printful_variant_id, print_area_width, print_area_height, print_area_top, print_area_left
+                 FROM product_variants WHERE id = ?`
+            ).bind(variantId).first();
+
+            if (!variantInfo || !variantInfo.printful_variant_id) {
+                throw new Error(`Could not find Printful variant ID or print area for DB variant ${variantId}`);
+            }
+            
+            const printfulVariantId = variantInfo.printful_variant_id;
+            console.log(`[DO MockupQueue] Found Printful variant ID: ${printfulVariantId} for DB variant ${variantId}`);
+
+            // 2. Construct Printful Mockup Task Payload
+            //    Positioning Logic: Center the image within the print area.
+            //    Printful's API positions based on the *print area* coordinates, not the template.
+            //    Assuming the image is intended to fill the print area width/height for now.
+            //    More sophisticated logic (scaling, aspect ratio handling) might be needed later.
+            const printfulPayload = {
+                variant_ids: [printfulVariantId],
+                format: 'png', // Request PNG mockups
+                files: [
+                    {
+                        placement: 'front', // Assuming 'front' placement for now
+                        image_url: imageUrl,
+                        position: { // Center within the print area
+                            area_width: variantInfo.print_area_width,
+                            area_height: variantInfo.print_area_height,
+                            width: variantInfo.print_area_width, // Use full print area width
+                            height: variantInfo.print_area_height, // Use full print area height
+                            top: 0, // Position relative to print area top-left
+                            left: 0 // Position relative to print area top-left
+                        }
+                    }
+                ],
+                // Use designId as external_id for webhook correlation
+                external_id: designId.toString() 
+            };
+
+            // console.log(`[DO MockupQueue] Calling Printful Mockup API for design ${designId}... Payload:`, JSON.stringify(printfulPayload, null, 2));
+            console.log(`[DO MockupQueue] Calling Printful Mockup API for design ${designId}...`);
+
+            // 3. Call Printful API
+            const printfulApiUrl = 'https://api.printful.com/v2/mockup-tasks';
+            const printfulResponse = await fetch(printfulApiUrl, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${this.printfulApiKey}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(printfulPayload)
+            });
+
+            const printfulResult = await printfulResponse.json();
+
+            if (!printfulResponse.ok) {
+                console.error(`[DO MockupQueue] Printful API error for design ${designId}:`, printfulResponse.status, printfulResult);
+                // Update design status to indicate error?
+                await this.updateDesignStatus(designId, 'mockup_error');
+                throw new Error(`Printful API request failed with status ${printfulResponse.status}`);
+            }
+
+            // console.log(`[DO MockupQueue] Printful mockup task created successfully for design ${designId}:`, printfulResult);
+            console.log(`[DO MockupQueue] Printful mockup task created successfully for design ${designId}. Task key: ${printfulResult?.task_key}`);
+
+            // Update design status to pending
+            await this.updateDesignStatus(designId, 'mockup_pending');
+
+            return new Response(JSON.stringify({ success: true, message: 'Mockup task queued with Printful' }), { status: 200 });
+
+        } catch (error) {
+            console.error(`[DO MockupQueue] Error processing mockup task for design ${designId}:`, error);
+            // Attempt to update design status to error
+            try {
+                 await this.updateDesignStatus(designId, 'mockup_error');
+            } catch (dbError) {
+                console.error(`[DO MockupQueue] Failed to update design ${designId} status to error after task failure:`, dbError);
+            }
+            return new Response(`Internal Server Error: ${error.message}`, { status: 500 });
+        }
+    }
+
+    // Helper to update design status in D1
+    async updateDesignStatus(designId, status) {
+        try {
+            await this.db.prepare(
+                `UPDATE designs SET status = ?, updated_at = datetime('now') WHERE id = ?`
+            ).bind(status, designId).run();
+            console.log(`[DO MockupQueue] Updated status for design ${designId} to ${status}`);
+        } catch (dbError) {
+            console.error(`[DO MockupQueue] Failed to update DB status for design ${designId} to ${status}:`, dbError);
+            // Re-throw? Or just log?
+            throw dbError; // Re-throw so the caller knows the update failed
+        }
+    }
+}
+</file>
+
+<file path="src/do/session.js">
+// api/src/do/session.js
+
+// Placeholder for Session Management Durable Object
+// Will handle WebSocket connections for real-time updates (e.g., mockup status)
+
+export class SessionDurableObject {
+    constructor(state, env) {
+        this.state = state;
+        this.env = env;
+        this.sessions = []; // Store WebSocket sessions
+        // Potentially load state from storage
+        // this.state.blockConcurrencyWhile(async () => {
+        //     this.value = await this.state.storage.get("value") || 0;
+        // });
+    }
+
+    // Handle HTTP requests (e.g., WebSocket upgrade)
+    async fetch(request) {
+        const url = new URL(request.url);
+
+        // Handle WebSocket upgrade requests from the main worker router
+        if (url.pathname.endsWith('/api/ws')) { // Match based on how router forwards
+            if (request.headers.get("Upgrade") != "websocket") {
+                return new Response("Expected Upgrade: websocket", { status: 400 });
+            }
+            const [client, server] = Object.values(new WebSocketPair());
+            await this.handleSession(server);
+            return new Response(null, { status: 101, webSocket: client });
+
+        // Handle internal notification requests from other parts of the worker (e.g., webhook handler)
+        } else if (url.pathname === '/notify' && request.method === 'POST') { 
+            try {
+                const notificationData = await request.json();
+                console.log('[SessionDO] Received notification:', notificationData);
+                this.broadcast(notificationData); // Broadcast the received data
+                return new Response(JSON.stringify({ success: true }), { status: 200 });
+            } catch (e) {
+                console.error('[SessionDO] Failed to process notification:', e);
+                return new Response('Invalid notification data', { status: 400 });
+            }
+        } else {
+             // Not a WebSocket upgrade or internal notification
+             return new Response('Not found', { status: 404 });
+        }
+    }
+
+     // Handle WebSocket session
+    async handleSession(webSocket) {
+        webSocket.accept();
+        this.sessions.push(webSocket);
+
+        webSocket.addEventListener("message", async event => {
+            console.log("DO received message:", event.data);
+            // Echo message back or handle client messages
+            // webSocket.send(JSON.stringify({ message: "DO received: " + event.data }));
+        });
+
+        webSocket.addEventListener("close", async event => {
+            console.log("DO session closed");
+            this.sessions = this.sessions.filter(s => s !== webSocket);
+        });
+
+         webSocket.addEventListener("error", async event => {
+            console.error("DO session error:", event);
+            this.sessions = this.sessions.filter(s => s !== webSocket);
+        });
+    }
+
+    // Broadcast a message to all connected WebSocket clients
+    broadcast(message) {
+        const messageString = typeof message === 'string' ? message : JSON.stringify(message);
+        console.log(`Broadcasting message to ${this.sessions.length} sessions: ${messageString}`);
+        this.sessions = this.sessions.filter(session => {
+            try {
+                session.send(messageString);
+                return true;
+            } catch (err) {
+                console.error("Failed to send message to session, removing:", err);
+                return false; // Remove broken session
+            }
+        });
+    }
+    
+     // Example of internal method callable via RPC or other means
+    async notify(data) {
+        console.log("DO notify called with:", data);
+        this.broadcast({ type: 'notification', payload: data });
+        // Persist state if needed
+        // await this.state.storage.put("lastNotification", data);
+    }
+
+}
+</file>
+
+<file path="src/routes/admin.js">
+import { Hono } from 'hono';
+import { seedProductData } from '../seed'; // Assuming seed logic is in seed.js
+
+const adminRoutes = new Hono();
+
+// --- Admin Routes ---
+
+// POST /api/admin/seed-product
+adminRoutes.post('/seed-product', async (c) => {
+    const env = c.env; // Get env from context first
+    // Correctly use context (c) to access request headers and env
+    if (c.req.headers.get('X-Admin-Secret') !== env.ADMIN_AUTH_KEY) { 
+        return c.json({error: 'Unauthorized'}, 401); // Use c.json for consistency
+    }
+
+    const productId = '586'; // Hardcoding the target product ID for now
+    const targetColors = [
+        'Berry', 'Black', 'Blue Jean', 'Brick',
+        'Grey', 'Moss', 'True Navy', 'White',
+    ];
+
+    console.log(`Received request to seed product ID: ${productId}`);
+
+    try {
+        const result = await seedProductData(env, productId, targetColors);
+        console.log('Seed Result:', result);
+        if (result.success) {
+            return c.json(result);
+        } else {
+            return c.json(result, 500);
+        }
+    } catch (err) {
+        console.error("Unhandled error in seed endpoint:", err);
+        return c.json({ success: false, message: 'Internal server error during seeding.' }, 500);
+    }
+});
+
+// POST /api/admin/import-product/:productId
+adminRoutes.post('/import-product/:productId', async (c) => {
+    const env = c.env;
+    if (c.req.headers.get('X-Admin-Secret') !== env.ADMIN_AUTH_KEY) {
+        return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    const { productId } = c.req.param();
+    console.log(`Received request to import product ID: ${productId}`);
+
+    try {
+        // Assuming seedProductData can handle product-specific logic
+        // and may not require targetColors for all product types.
+        // Passing an empty array or null if colors are not applicable for the given product.
+        const result = await seedProductData(env, productId, []); 
+        console.log('Import Result:', result);
+        if (result.success) {
+            return c.json(result);
+        } else {
+            return c.json(result, result.status || 500); // Use status from result if available
+        }
+    } catch (err) {
+        console.error(`Error importing product ID ${productId}:`, err);
+        return c.json({ success: false, message: 'Internal server error during product import.' }, 500);
+    }
+});
+
+export default adminRoutes;
+</file>
+
+<file path="src/routes/imageUtils.js">
+import { Hono } from 'hono';
+
+const imageUtils = new Hono();
+
+// Route to remove background using Pixian AI
+imageUtils.post('/remove-background', async (c) => {
+  const { PIXIAN_API_ID, PIXIAN_API_SECRET } = c.env;
+
+  if (!PIXIAN_API_ID || !PIXIAN_API_SECRET) {
+    console.error('Pixian API credentials missing in environment variables.');
+    return c.json({ error: 'Configuration error', message: 'Background removal service is not configured.' }, 500);
+  }
+
+  try {
+    const formData = await c.req.formData();
+    const imageFile = formData.get('image');
+
+    if (!imageFile || !(imageFile instanceof File || imageFile instanceof Blob)) {
+      return c.json({ error: 'Bad Request', message: 'No image file provided or invalid format.' }, 400);
+    }
+
+    // Prepare FormData to send to Pixian
+    const pixianFormData = new FormData();
+    pixianFormData.append('image', imageFile, imageFile.name || 'image_to_process.png'); // Use original name if available
+    pixianFormData.append('output_format', 'png');
+    pixianFormData.append('result.crop_to_foreground', 'true');
+
+    // Encode credentials for Basic Auth
+    const credentials = btoa(`${PIXIAN_API_ID}:${PIXIAN_API_SECRET}`);
+
+    const pixianApiUrl = 'https://api.pixian.ai/api/v2/remove-background';
+
+    console.log(`Calling Pixian API for background removal...`);
+
+    const pixianResponse = await fetch(pixianApiUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${credentials}`,
+        // 'Content-Type' is set automatically by fetch when using FormData body
+      },
+      body: pixianFormData,
+    });
+
+    if (!pixianResponse.ok) {
+      let errorBody = 'Failed to parse Pixian error response.';
+      try {
+         errorBody = await pixianResponse.text();
+      } catch (e) { /* Ignore parsing error */ }
+      console.error(`Pixian API Error: ${pixianResponse.status} ${pixianResponse.statusText}`, errorBody);
+      return c.json({ error: 'Background removal failed', message: `Upstream service returned status ${pixianResponse.status}. ${errorBody}` }, 502); // 502 Bad Gateway
+    }
+
+    console.log(`Pixian API call successful.`);
+
+    // Get the resulting image as a Blob
+    const resultBlob = await pixianResponse.blob();
+
+    // Return the resulting image blob directly to the client
+    // Set appropriate headers for the client
+    c.header('Content-Type', resultBlob.type || 'image/png'); // Use type from Pixian if available, else default
+    c.header('Content-Disposition', 'inline; filename="background_removed.png"'); // Suggest filename
+    
+    return c.body(resultBlob);
+
+  } catch (error) {
+    console.error('Error processing background removal request:', error);
+    if (error instanceof Error) {
+        return c.json({ error: 'Internal Server Error', message: error.message }, 500);
+    } else {
+        return c.json({ error: 'Internal Server Error', message: 'An unknown error occurred.' }, 500);
+    }
+    
+  }
+});
+
+export default imageUtils;
+</file>
+
+<file path="src/routes/protected.js">
+import { Hono } from 'hono';
+import { authMiddleware } from '../auth'; // Import auth middleware
+
+// Helper function to generate a unique filename (e.g., UUID)
+// Using Web Crypto API available in Workers
+function generateUUID() {
+    return crypto.randomUUID();
+}
+
+// Helper to get file extension
+function getExtension(filename) {
+    return filename.substring(filename.lastIndexOf('.') + 1) || 'png'; // Default to png if no extension
+}
+
+const protectedRoutes = new Hono();
+
+// Apply auth middleware to all routes in this file
+protectedRoutes.use('*', authMiddleware);
+
+// --- Protected Routes ---
+
+// GET /api/designs - List user's designs
+protectedRoutes.get('/designs', async (c) => {
+  const userFid = c.get('userFid');
+  if (!userFid) {
+    // Should be caught by middleware, but belt-and-suspenders
+    return c.json({ error: 'Unauthorized: Missing user FID in context' }, 401);
+  }
+
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, product_id, variant_id, image_url, mockup_url, status, is_public, created_at, updated_at
+       FROM designs WHERE fid = ? ORDER BY created_at DESC`
+    ).bind(userFid).all();
+    return c.json({ designs: results || [] });
+  } catch (e) {
+    console.error("Error fetching user designs:", e);
+    return c.json({ error: 'Failed to fetch designs' }, 500);
+  }
+});
+
+// POST /api/designs - Create a new design (handles multipart/form-data)
+protectedRoutes.post('/designs', async (c) => {
+    const userFid = c.get('userFid');
+    if (!userFid) {
+        return c.json({ error: 'Unauthorized: Missing user FID in context' }, 401);
+    }
+
+    let formData;
+    try {
+        formData = await c.req.formData();
+    } catch (e) {
+        console.error("Error parsing form data:", e);
+        return c.json({ success: false, message: 'Invalid form data' }, 400);
+    }
+
+    const product_id = formData.get('product_id');
+    const variant_id = formData.get('variant_id');
+    const imageFile = formData.get('image'); // Assuming the file input name is 'image'
+
+    // Validation
+    if (!product_id || !variant_id || !(imageFile instanceof File)) {
+        return c.json({ success: false, message: 'Missing required fields: product_id, variant_id, and image file' }, 400);
+    }
+
+    if (!c.env.R2_BUCKET || !c.env.R2_PUBLIC_URL) {
+        console.error('R2 environment variables not configured');
+        return c.json({ success: false, message: 'Server configuration error for image storage.' }, 500);
+    }
+
+    const db = c.env.DB;
+    const r2 = c.env.R2_BUCKET;
+    const r2PublicUrl = c.env.R2_PUBLIC_URL;
+
+    try {
+        // Generate R2 key
+        const fileExtension = getExtension(imageFile.name);
+        const uniqueFilename = `${generateUUID()}.${fileExtension}`;
+        const r2Key = `user-images/${userFid}/${product_id}/${uniqueFilename}`;
+
+        // Upload to R2
+        await r2.put(r2Key, await imageFile.arrayBuffer(), {
+            httpMetadata: { contentType: imageFile.type || 'image/png' }
+        });
+        const imageUrl = `${r2PublicUrl.replace(/\/$/, '')}/${r2Key}`;
+        console.log(`Design image uploaded: ${imageUrl}`);
+
+        // Insert into Database
+        const result = await db.prepare(
+            `INSERT INTO designs (fid, product_id, variant_id, image_url, status)
+             VALUES (?, ?, ?, ?, 'draft') RETURNING id`
+        ).bind(userFid, product_id, variant_id, imageUrl).first();
+
+        const newDesignId = result?.id;
+        if (!newDesignId) {
+            // Attempt to clean up R2 upload if DB insert fails?
+            // await r2.delete(r2Key);
+            throw new Error("Failed to insert design into database after image upload.");
+        }
+        console.log(`Design DB record created for FID ${userFid} with ID ${newDesignId}.`);
+
+        // Enqueue mockup generation task
+        try {
+            // Use the correct binding name from wrangler.toml
+            const doBinding = c.env.MOCKUP_QUEUE_DO; 
+            if (!doBinding) {
+                throw new Error("MOCKUP_QUEUE_DO binding is not configured in wrangler.toml or not available in env.");
+            }
+            const doId = doBinding.idFromName("singleton"); // Use a consistent name for the queue DO
+            const stub = doBinding.get(doId);
+
+            // Send the task to the DO
+            await stub.fetch('http://do-mockup-queue/queue', { // Use a dummy internal URL
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ 
+                    designId: newDesignId,
+                    imageUrl: imageUrl,
+                    variantId: parseInt(variant_id) // Pass variant_id too, needed for Printful
+                })
+            });
+            console.log(`Mockup task enqueued for design ID: ${newDesignId}`);
+        } catch (doError) {
+            console.error(`Failed to enqueue mockup task for design ${newDesignId}:`, doError);
+            // Decide how to handle this: maybe update design status to 'queue_failed'?
+            // For now, we'll just log it and return success for the design creation itself.
+            // Optionally, could return a 202 Accepted with a warning.
+        }
+
+        return c.json({ success: true, designId: newDesignId, imageUrl: imageUrl }, 201);
+
+    } catch (e) {
+        console.error("Error processing design creation:", e);
+        if (e.message && e.message.includes('FOREIGN KEY constraint failed')) {
+            return c.json({ success: false, message: 'Invalid product_id or variant_id.' }, 400);
+        }
+        return c.json({ success: false, message: 'Failed to create design' }, 500);
+    }
+});
+
+// POST /api/designs/:design_id/publish - Publish a design (stub)
+protectedRoutes.post('/designs/:design_id/publish', (c) => {
+    const userFid = c.get('userFid');
+    const designId = c.req.param('design_id');
+    console.log(`Publishing design ${designId} for user FID: ${userFid}`);
+    // TODO: Implement publish logic (update is_public, set royalty, calculate price)
+    return c.json({ message: `Publish design ${designId} for ${userFid} not implemented yet` }, 501);
+});
+
+// GET /api/orders - List user's orders (stub)
+protectedRoutes.get('/orders', (c) => {
+    const userFid = c.get('userFid');
+    console.log(`Fetching orders for user FID: ${userFid}`);
+    // TODO: Implement order fetching logic
+    return c.json({ message: `User ${userFid} orders list not implemented yet` }, 501);
+});
+
+// POST /api/orders - Create an order (stub)
+protectedRoutes.post('/orders', (c) => {
+    const userFid = c.get('userFid');
+    console.log(`Creating order for user FID: ${userFid}`);
+    // TODO: Implement order creation logic
+    return c.json({ message: `Create order for ${userFid} not implemented yet` }, 501);
+});
+
+// GET /api/orders/:order_id/signature - Generate payment signature (stub)
+protectedRoutes.get('/orders/:order_id/signature', (c) => {
+    const userFid = c.get('userFid');
+    const orderId = c.req.param('order_id');
+    console.log(`Generating signature for order ${orderId} requested by FID: ${userFid}`);
+    // TODO: Implement signature generation logic
+    return c.json({ message: `Generate signature for order ${orderId} (user ${userFid}) not implemented yet` }, 501);
+});
+
+export default protectedRoutes;
+</file>
+
+<file path="src/routes/public.js">
+import { Hono } from 'hono';
+import { handleSignIn } from '../auth'; // Assuming auth handler is separate
+
+const publicRoutes = new Hono();
+
+// --- Public Routes ---
+
+// POST /api/auth/signin
+publicRoutes.post('/auth/signin', async (c) => {
+    return handleSignIn(c.req.raw, c.env);
+});
+
+// GET /api/products
+publicRoutes.get('/products', async (c) => {
+    const env = c.env;
+    try {
+        // Fetch all active products
+        const { results: products } = await env.DB.prepare(
+            "SELECT id, name, slug, printful_product_id FROM products WHERE status = 'active'"
+        ).all();
+
+        if (!products || products.length === 0) {
+            return c.json({ products: [] });
+        }
+
+        // Fetch variants for all active products
+        const placeholders = products.map(() => '?').join(',');
+        const productIds = products.map(p => p.id);
+        const query = `
+          SELECT
+            pv.id, pv.product_id, pv.printful_variant_id,
+            pv.color_name, pv.color_code, pv.size, pv.printful_price,
+            pv.inventory_count, pv.status,
+            pv.template_image_url, pv.template_texture_url, pv.template_width, pv.template_height,
+            pv.print_area_width, pv.print_area_height, pv.print_area_top, pv.print_area_left
+          FROM product_variants pv
+          WHERE pv.product_id IN (${placeholders})
+            AND pv.status != 'discontinued'
+          ORDER BY pv.product_id, pv.size
+        `;
+        const { results: allVariants } = await env.DB.prepare(query).bind(...productIds).all();
+
+        // Group variants by product ID
+        const variantsByProductId = allVariants.reduce((acc, variant) => {
+            if (!acc[variant.product_id]) {
+                acc[variant.product_id] = [];
+            }
+            acc[variant.product_id].push(variant);
+            return acc;
+        }, {});
+
+        // Structure the response
+        const responseProducts = products.map(product => {
+            const productVariants = variantsByProductId[product.id] || [];
+            const options = {
+                color_name: [...new Set(productVariants.map(v => v.color_name))].sort(),
+                size: [...new Set(productVariants.map(v => v.size))].sort((a, b) => {
+                    const sizeOrder = { 'S': 1, 'M': 2, 'L': 3, 'XL': 4 };
+                    return (sizeOrder[a] || 99) - (sizeOrder[b] || 99);
+                }),
+            };
+            const colors = options.color_name.map(colorName => {
+                const variantsOfColor = productVariants.filter(v => v.color_name === colorName);
+                const representativeVariant = variantsOfColor.find(v => v.size === 'M') || variantsOfColor[0];
+                const basePrice = representativeVariant ? representativeVariant.printful_price : null;
+                const colorCode = representativeVariant ? representativeVariant.color_code : null;
+
+                return {
+                    color_name: colorName,
+                    color_code: colorCode,
+                    base_price: basePrice,
+                    variants: variantsOfColor.map(v => ({
+                        id: v.id,
+                        printful_variant_id: v.printful_variant_id,
+                        size: v.size,
+                        inventory_count: v.inventory_count,
+                        status: v.status,
+                        base_price: v.printful_price,
+                        template_image_url: v.template_image_url,
+                        template_texture_url: v.template_texture_url,
+                        template_width: v.template_width,
+                        template_height: v.template_height,
+                        print_area_width: v.print_area_width,
+                        print_area_height: v.print_area_height,
+                        print_area_top: v.print_area_top,
+                        print_area_left: v.print_area_left,
+                    })),
+                };
+            });
+            return {
+                id: product.id,
+                printful_product_id: product.printful_product_id,
+                name: product.name,
+                slug: product.slug,
+                options: options,
+                colors: colors,
+            };
+        });
+        return c.json({ products: responseProducts });
+    } catch (e) {
+        console.error("Error fetching products:", e);
+        return c.json({ error: 'Error fetching products' }, 500);
+    }
+});
+
+// GET /api/products/:product_id/variants
+publicRoutes.get('/products/:product_id/variants', async (c) => {
+    const productId = c.req.param('product_id');
+    console.log(`Fetching variants for product ${productId}`);
+    if (!productId) {
+        return c.json({ error: "Missing product_id parameter" }, 400);
+    }
+    try {
+        const { results: variants } = await c.env.DB.prepare(
+            `SELECT id, color_name, size, inventory_count
+             FROM product_variants
+             WHERE product_id = ?`
+        ).bind(productId).all();
+
+        if (!variants) {
+            console.error(`Error fetching variants for product ${productId}: Query failed`);
+            return c.json({ error: "Failed to fetch variants" }, 500);
+        }
+
+        if (variants.length === 0) {
+            const { results: productCheck } = await c.env.DB.prepare(
+                `SELECT 1 FROM products WHERE id = ? LIMIT 1`
+            ).bind(productId).all();
+            if (!productCheck || productCheck.length === 0) {
+                return c.json({ error: `Product with ID ${productId} not found` }, 404);
+            }
+        }
+        const formattedVariants = variants.map(v => ({
+            id: v.id,
+            color_name: v.color_name,
+            size: v.size,
+            inventory_count: v.inventory_count
+        }));
+        return c.json({ variants: formattedVariants });
+    } catch (error) {
+        console.error(`Error fetching variants for product ${productId}:`, error);
+        return c.json({ error: "Failed to fetch variants" }, 500);
+    }
+});
+
+// GET /api/designs/:design_id (Public view)
+publicRoutes.get('/designs/:design_id', (c) => {
+    const designId = c.req.param('design_id');
+    // TODO: Fetch public design details from D1 (where is_public = true)
+    console.log(`Fetching public design ${designId}`);
+    return c.json({ message: `Public view for design ${designId} not implemented yet` }, 501);
+});
+
+// GET /api/feed (Public)
+publicRoutes.get('/feed', (c) => {
+    const page = c.req.query('page') || 1;
+    const limit = c.req.query('limit') || 10;
+    // TODO: Fetch paginated public designs from D1
+    console.log(`Fetching public feed (page=${page}, limit=${limit})`);
+    return c.json({ message: 'Public feed not implemented yet' }, 501);
+});
+
+// NEW: Generate Nonce Endpoint
+publicRoutes.get('/auth/nonce', async (c) => {
+    try {
+        // Generate a secure random nonce (e.g., using Web Crypto API if available in CF Workers)
+        // crypto.randomUUID() is generally available and suitable
+        const nonce = crypto.randomUUID().replace(/-/g, ''); // Remove hyphens for simplicity
+        console.log('Generated nonce:', nonce);
+        return c.json({ nonce });
+    } catch (error) {
+        console.error("Error generating nonce:", error);
+        // Fallback if crypto API isn't available (less secure)
+        try {
+            const fallbackNonce = Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+            console.warn('Using fallback nonce generation');
+            return c.json({ nonce: fallbackNonce });
+        } catch (fallbackError) {
+             console.error("Fallback nonce generation also failed:", fallbackError);
+             return c.json({ error: 'Failed to generate nonce' }, 500);
+        }
+    }
+});
+
+export default publicRoutes;
+</file>
+
+<file path="src/routes/webhooks.js">
+import { Hono } from 'hono';
+
+const webhookRoutes = new Hono();
+
+// --- Webhook Routes ---
+
+// POST /api/webhooks/printful
+webhookRoutes.post('/printful', async (c) => {
+    const db = c.env.DB;
+    if (!db) {
+        console.error('[Webhook Printful] DB binding not available.');
+        return c.json({ error: 'Internal Server Error: Database binding missing' }, 500);
+    }
+
+    let payload;
+    try {
+        payload = await c.req.json();
+        // console.log('[Webhook Printful] Received payload:', JSON.stringify(payload, null, 2));
+    } catch (e) {
+        console.error('[Webhook Printful] Failed to parse request body:', e);
+        return c.json({ error: 'Invalid request body' }, 400);
+    }
+
+    // TODO: Implement Printful webhook signature verification if available/required
+    // const signature = c.req.header('X-Printful-Signature'); // Example header
+    // if (!isValidSignature(payload, signature, c.env.PRINTFUL_WEBHOOK_SECRET)) {
+    //     console.warn('[Webhook Printful] Invalid signature received');
+    //     return c.json({ error: 'Invalid signature' }, 401);
+    // }
+
+    const eventType = payload.type;
+    const task = payload.data?.task; // Data structure might vary based on event
+    const mockup = payload.data?.mockup; // Data structure for finished mockup
+
+    // Check if it's a finished mockup task
+    if (eventType === 'mockup_task_finished' && mockup) {
+        const externalId = mockup.external_id;
+        const mockupUrl = mockup.mockup_url;
+
+        if (!externalId || !mockupUrl) {
+            console.error('[Webhook Printful] Missing external_id or mockup_url in finished event', payload);
+            return c.json({ error: 'Missing required data in webhook payload' }, 400);
+        }
+
+        const designId = parseInt(externalId, 10);
+        if (isNaN(designId)) {
+            console.error('[Webhook Printful] Invalid external_id (designId):', externalId);
+            return c.json({ error: 'Invalid external_id' }, 400);
+        }
+
+        console.log(`[Webhook Printful] Mockup finished for design ${designId}. URL: ${mockupUrl}`);
+
+        try {
+            // Update the design record in D1
+            console.log(`[Webhook Printful] Attempting update for ID: ${designId} with status IN check.`);
+            await db.prepare(
+                `UPDATE designs
+                 SET mockup_url = ?, status = 'mockup_ready', updated_at = datetime('now')
+                 WHERE id = ? AND status IN (?, ?)`
+            ).bind(mockupUrl, designId, 'mockup_pending', 'draft').run();
+
+            // Assume success if no error is thrown, as result.changes might be unreliable in local D1 simulation.
+            console.log(`[Webhook Printful] Successfully updated design ${designId} with mockup URL (or assumed success).`);
+
+            // Notify Session Durable Object via WebSocket
+            try {
+                // Get the FID associated with this design
+                const designInfo = await db.prepare(
+                    `SELECT fid FROM designs WHERE id = ?`
+                ).bind(designId).first();
+
+                if (designInfo && designInfo.fid) {
+                    const userFid = designInfo.fid;
+                    const sessionDoBinding = c.env.SESSION_DO;
+                    if (!sessionDoBinding) {
+                         console.error('[Webhook Printful] SESSION_DO binding missing. Cannot notify client.');
+                    } else {
+                        const doId = sessionDoBinding.idFromName(userFid.toString());
+                        const stub = sessionDoBinding.get(doId);
+                        // Send notification asynchronously (fire-and-forget)
+                        stub.fetch('http://do-session/notify', { 
+                            method: 'POST', 
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ type: 'mockup_ready', designId, mockupUrl })
+                        }); 
+                        console.log(`[Webhook Printful] Sent mockup_ready notification to SessionDO for FID ${userFid}, Design ${designId}`);
+                    }
+                } else {
+                    console.warn(`[Webhook Printful] Could not find FID for design ${designId} to send notification.`);
+                }
+            } catch (notifyError) {
+                console.error(`[Webhook Printful] Error sending notification for design ${designId}:`, notifyError);
+            }
+
+            return c.json({ success: true }); // Acknowledge receipt
+        } catch (e) {
+            console.error(`[Webhook Printful] Failed to update database for design ${designId}:`, e);
+            return c.json({ error: 'Database update failed' }, 500);
+        }
+
+    } else if (eventType === 'mockup_task_failed' && task) {
+        const externalId = task.external_id;
+        const reason = task.reason || 'Unknown error';
+        
+        if (!externalId) {
+             console.error('[Webhook Printful] Missing external_id in failed event', payload);
+             return c.json({ error: 'Missing external_id in failure payload' }, 400);
+        }
+        
+        const designId = parseInt(externalId, 10);
+        if (isNaN(designId)) {
+            console.error('[Webhook Printful] Invalid external_id (designId) in failed event:', externalId);
+            return c.json({ error: 'Invalid external_id' }, 400);
+        }
+        
+        console.warn(`[Webhook Printful] Mockup task failed for design ${designId}. Reason: ${reason}`);
+        
+         try {
+            await db.prepare(
+                `UPDATE designs SET status = 'mockup_error', updated_at = datetime('now')
+                 WHERE id = ? AND status = 'mockup_pending'`
+            ).bind(designId).run();
+            console.log(`[Webhook Printful] Updated status to mockup_error for design ${designId}.`);
+            // TODO: Notify Session Durable Object about failure?
+            try {
+                 // Get the FID associated with this design
+                const designInfo = await db.prepare(
+                    `SELECT fid FROM designs WHERE id = ?`
+                ).bind(designId).first();
+                
+                if (designInfo && designInfo.fid) {
+                    const userFid = designInfo.fid;
+                    const sessionDoBinding = c.env.SESSION_DO;
+                    if (sessionDoBinding) {
+                        const doId = sessionDoBinding.idFromName(userFid.toString());
+                        const stub = sessionDoBinding.get(doId);
+                        stub.fetch('http://do-session/notify', { 
+                            method: 'POST', 
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ type: 'mockup_error', designId, reason })
+                        }); 
+                         console.log(`[Webhook Printful] Sent mockup_error notification to SessionDO for FID ${userFid}, Design ${designId}`);
+                    }
+                } 
+            } catch (notifyError) {
+                 console.error(`[Webhook Printful] Error sending failure notification for design ${designId}:`, notifyError);
+            }
+        } catch (e) {
+            console.error(`[Webhook Printful] Failed to update database status to error for design ${designId}:`, e);
+            // Don't return 500, Printful might retry. Log error and return success.
+        }
+        
+        return c.json({ success: true }); // Acknowledge receipt even on failure update
+
+    } else {
+        console.log(`[Webhook Printful] Received unhandled event type: ${eventType}`);
+        return c.json({ message: 'Webhook received, event type not processed' });
+    }
+});
+
+export default webhookRoutes;
+</file>
+
+<file path="src/routes/websockets.js">
+import { Hono } from 'hono';
+import { authMiddleware } from '../auth'; // Import auth middleware
+
+const websocketRoutes = new Hono();
+
+// Apply auth middleware - WebSocket connections should be authenticated
+websocketRoutes.use('*', authMiddleware);
+
+// GET /api/ws - Handles WebSocket upgrade requests
+websocketRoutes.get('/', (c) => {
+    const userFid = c.get('userFid');
+    if (!userFid) {
+        // Should be caught by middleware, but double-check
+        return c.json({ error: 'Unauthorized: Missing user FID in context' }, 401);
+    }
+
+    // Check for the Upgrade header
+    const upgradeHeader = c.req.header('Upgrade');
+    if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
+        return new Response('Expected Upgrade: websocket', { status: 426 }); // 426 Upgrade Required
+    }
+
+    // Get the Durable Object binding
+    const sessionDoBinding = c.env.SESSION_DO;
+    if (!sessionDoBinding) {
+        console.error('SESSION_DO binding missing in environment.');
+        return new Response('Internal Server Error: WebSocket service not configured.', { status: 500 });
+    }
+
+    try {
+        // Get the specific DO instance for this user FID
+        const doId = sessionDoBinding.idFromName(userFid.toString());
+        const stub = sessionDoBinding.get(doId);
+
+        // Forward the request (including headers) to the Durable Object
+        // The DO's fetch handler will perform the WebSocket handshake
+        console.log(`Forwarding WebSocket request for FID ${userFid} to SessionDO ${doId.toString()}`);
+        return stub.fetch(c.req.raw); 
+    } catch (e) {
+        console.error(`Error getting/fetching SessionDO for FID ${userFid}:`, e);
+        return new Response('Internal Server Error: Could not establish WebSocket connection.', { status: 500 });
+    }
+});
+
+export default websocketRoutes;
+</file>
+
+<file path="src/auth.js">
+import { createAppClient, viemConnector } from '@farcaster/auth-client';
+import { sign, verify } from '@tsndr/cloudflare-worker-jwt';
+
+/**
+ * Handles the Sign-In With Farcaster verification and JWT issuance.
+ * @param {Request} request - The incoming request object.
+ * @param {object} env - The worker environment object (must contain AUTH_SECRET).
+ * @returns {Promise<Response>} - A Response object with the JWT or an error.
+ */
+export async function handleSignIn(request, env) {
+    // --- Dynamically derive APP_DOMAIN from request URL ---
+    let appDomain;
+    try {
+        const url = new URL(request.url);
+        appDomain = url.port ? `${url.hostname}:${url.port}` : url.hostname;
+        console.log(`handleSignIn: Derived APP_DOMAIN: ${appDomain} from request URL: ${request.url}`);
+    } catch (e) {
+        console.error("handleSignIn: Failed to parse request URL to derive APP_DOMAIN:", e);
+        return Response.json({ success: false, message: 'Server configuration error (domain parsing).' }, { status: 500 });
+    }
+    // ---
+
+    const { message, signature, nonce } = await request.json();
+
+    if (!message || !signature || !nonce) {
+        return Response.json({ success: false, message: 'Missing message, signature, or nonce.' }, { status: 400 });
+    }
+
+    if (!env.AUTH_SECRET) {
+        console.error("handleSignIn: AUTH_SECRET environment variable not set!");
+        return Response.json({ success: false, message: 'Authentication system configuration error.' }, { status: 500 });
+    }
+
+    try {
+        // TODO: Consider adding nonce validation
+        console.log(`handleSignIn: Verifying SIWF message for domain: ${appDomain}...`);
+
+        const appClient = createAppClient({
+            ethereum: viemConnector() // Assumes viem is available
+        });
+
+        const verifyResponse = await appClient.verifySignInMessage({
+            message,
+            signature,
+            domain: appDomain,
+            nonce,
+        });
+
+        // Use `.success` based on user's update
+        if (!verifyResponse.success) { 
+            console.error('handleSignIn: SIWF verification failed:', verifyResponse.error);
+            const errorDetail = verifyResponse.error?.message || 'Unknown verification error';
+            return Response.json({ success: false, message: `Signature verification failed: ${errorDetail}` }, { status: 401 });
+        }
+
+        const fid = verifyResponse.fid;
+        console.log(`handleSignIn: Verification successful for FID: ${fid} (verified against domain: ${verifyResponse.domain})`);
+
+        // --- Issue JWT ---
+        const payload = {
+            sub: fid.toString(),
+            fid: fid, // Include fid directly as per user's update
+            iss: appDomain,
+            iat: Math.floor(Date.now() / 1000),
+            exp: Math.floor(Date.now() / 1000) + (60 * 60 * 24 * 7) // 7 days expiry
+        };
+
+        const token = await sign(payload, env.AUTH_SECRET);
+        console.log(`handleSignIn: JWT issued for FID: ${fid}`);
+        // ---
+
+        return Response.json({ success: true, token: token, fid: fid });
+
+    } catch (error) {
+        console.error('handleSignIn: Error during SIWF verification or JWT signing:', error);
+        let errorMessage = 'An unexpected error occurred during sign-in.';
+        if (error instanceof Error) {
+            errorMessage = error.message;
+        }
+        return Response.json({ success: false, message: errorMessage }, { status: 500 });
+    }
+}
+
+/**
+ * Verifies a JWT token.
+ * @param {string} token - The JWT string.
+ * @param {string} secret - The secret key used for signing.
+ * @returns {Promise<{isValid: boolean, payload?: object, error?: string}>} - Verification result.
+ */
+export async function verifyToken(token, secret) {
+    try {
+        const isValid = await verify(token, secret);
+        if (!isValid) {
+             return { isValid: false, error: 'Invalid token signature.' };
+        }
+        // Decode payload without verification (since we already verified signature)
+        // Note: @tsndr/cloudflare-worker-jwt verify() only checks signature & expiry
+        // For full claim validation (iss, aud, etc.), you might need another library or manual checks
+        const { payload } = decode(token);
+        // Optional: Check expiry again just to be sure (verify should handle it though)
+        if (payload.exp && payload.exp * 1000 < Date.now()) {
+            return { isValid: false, error: 'Token expired.' };
+        }
+        return { isValid: true, payload: payload };
+    } catch (err) {
+        console.error("Token verification error:", err);
+         if (err.message === 'Expired JWT') {
+             return { isValid: false, error: 'Token expired.' };
+         }
+        return { isValid: false, error: 'Invalid token format or verification failed.' };
+    }
+}
+
+// Helper function to decode JWT payload (needed because verify only returns boolean)
+function decode(token) {
+    const parts = token.split('.');
+    if (parts.length !== 3) {
+        throw new Error('Invalid token format');
+    }
+    const [header, payload, signature] = parts;
+    const decodedPayload = JSON.parse(atob(payload.replace(/-/g, '+').replace(/_/g, '/')));
+    const decodedHeader = JSON.parse(atob(header.replace(/-/g, '+').replace(/_/g, '/')));
+    return { header: decodedHeader, payload: decodedPayload, signature };
+}
+
+/**
+ * Middleware to verify JWT token from Authorization header.
+ * Sets c.userFid if valid.
+ */
+export const authMiddleware = async (c, next) => {
+	// console.log("Auth Middleware triggered"); // Removed
+	const authHeader = c.req.headers.get('Authorization');
+	if (!authHeader || !authHeader.startsWith('Bearer ')) {
+		// console.log("Auth Middleware: Missing/invalid header"); // Removed
+		return c.json({ error: 'Unauthorized: Missing or invalid Authorization header.' }, 401);
+	}
+	const token = authHeader.substring(7); // Remove "Bearer "
+	const secret = c.env.AUTH_SECRET;
+	
+	if (!secret) {
+		console.error("Auth Middleware: AUTH_SECRET missing in environment!");
+		return c.json({ error: 'Server configuration error.' }, 500);
+	}
+
+	// console.log(`Auth Middleware: Verifying token (first 10 chars): ${token.substring(0, 10)}...`); // Removed
+	// console.log(`Auth Middleware: Using secret (type: ${typeof secret}, length: ${secret?.length})`); // Removed
+
+	try {
+		// console.log("Auth Middleware: Attempting jwt.verify..."); // Removed
+		const isValid = await verify(token, secret, { algorithm: 'HS256' }); 
+		// console.log(`Auth Middleware: jwt.verify result: ${isValid}`); // Removed
+		
+		if (!isValid) {
+			// console.error("Auth Middleware: Token failed jwt.verify (isValid=false)"); // Removed
+			throw new Error('Invalid token (verify step)');
+		}
+
+		// console.log("Auth Middleware: Attempting jwt.decode..."); // Removed
+		const { payload } = decode(token);
+		// console.log("Auth Middleware: Decoded payload:", payload); // Removed
+
+		if (!payload || !payload.fid) {
+			// console.error("Auth Middleware: Token payload invalid or missing fid"); // Removed
+			throw new Error('Invalid token payload');
+		}
+
+		c.set('userFid', payload.fid);
+		// console.log(`Auth Middleware: FID ${payload.fid} authorized and set in context.`); // Removed
+
+	} catch (err) {
+		console.error("Auth Middleware: Verification/Decode Error:", err.message); // Keep this error log
+		return c.json({ error: 'Unauthorized: Invalid token.' }, 401);
+	}
+
+	// console.log("Auth Middleware: Proceeding to next handler..."); // Removed
+	await next();
+};
+</file>
+
+<file path="src/index.js">
+import { Hono } from 'hono';
+import { cors } from 'hono/cors';
+
+// Import Routers
+import publicRoutes from './routes/public';
+import protectedRoutes from './routes/protected';
+import adminRoutes from './routes/admin';
+import webhookRoutes from './routes/webhooks';
+import websocketRoutes from './routes/websockets';
+import imageUtils from './routes/imageUtils';
+
+// Import Scheduled Handler and DO Exports
+import { handleScheduled } from './scheduled'; 
+import { SessionDurableObject } from './do/session'; 
+import { MockupQueueDurableObject } from './do/mockup_queue'; 
+
+const app = new Hono();
+
+// --- Global Middleware ---
+app.use('/api/*', cors({
+	origin: (origin) => {
+		// Allow requests from localhost:3000 during development
+		// TODO: Add production frontend URL(s) here
+		const allowedOrigins = [
+			'http://localhost:3000',
+			'https://swag.kasra.codes' // Example production URL
+		];
+		if (allowedOrigins.includes(origin)) {
+			return origin; 
+		}
+		// Allow other types of requests (e.g. mobile apps, curl)
+		// Or handle them more strictly based on requirements
+		return origin; // Allow any origin for now, refine later if needed
+	},
+	allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], // MUST include OPTIONS
+	allowHeaders: ['Content-Type', 'Authorization'], // MUST include Authorization and Content-Type
+	maxAge: 600, // Cache preflight response for 10 minutes
+	credentials: true, // Allow cookies if needed later (doesn't hurt now)
+}));
+
+// --- Register Routes (Revised Order) ---
+// Register more specific routes first
+app.route('/api/admin', adminRoutes);      // Handles /api/admin/*
+app.route('/api/webhooks', webhookRoutes); // Handles /api/webhooks/*
+app.route('/api/ws', websocketRoutes);     // Handles /api/ws/*
+
+// Register broader /api routes
+app.route('/api/image', imageUtils);      // <-- Register public image utils
+app.route('/api', publicRoutes);         // Handles public /api/auth/signin, /api/products, /api/feed
+app.route('/api', protectedRoutes);      // Handles protected /api/designs, /api/orders
+
+// --- Root and Error Handling ---
+app.get('/', (c) => c.text('FC Swag API - Root'));
+
+app.notFound((c) => {
+	return c.json({ error: 'Not Found', message: `The requested path ${c.req.url} was not found on this server.` }, 404);
+})
+
+app.onError((err, c) => {
+	console.error(`[onError] ${c.req.url}: ${err}`, err.stack);
+	return c.json({ error: 'Internal Server Error', message: err.message }, 500);
+});
+
+// --- Exports ---
+export default {
+	fetch: app.fetch,
+	scheduled: handleScheduled,
+};
+
+// Export Durable Objects
+export { SessionDurableObject }; 
+export { MockupQueueDurableObject };
+</file>
+
+<file path="src/printful.js">
+const BASE_URL = 'https://api.printful.com/v2';
+
+/**
+ * Helper function to make authenticated requests to the Printful API.
+ * @param {string} endpoint - The API endpoint path (e.g., '/catalog-products/586')
+ * @param {string} apiKey - The Printful API key.
+ * @param {object} options - Fetch options (method, headers, body, etc.).
+ * @returns {Promise<object>} - The JSON response from the API.
+ * @throws {Error} - Throws an error if the request fails.
+ */
+async function fetchPrintfulAPI(endpoint, apiKey, options = {}) {
+    const url = `${BASE_URL}${endpoint}`;
+    const headers = {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        ...options.headers,
+    };
+
+    const response = await fetch(url, { ...options, headers });
+
+    if (!response.ok) {
+        let errorBody = 'Could not read error body';
+        try {
+            errorBody = await response.json(); // Printful V2 uses application/problem+json
+        } catch (e) { /* ignore */ }
+
+        console.error(`Printful API Error (${response.status}): ${response.statusText} for ${url}`);
+        console.error('Response Body:', JSON.stringify(errorBody));
+        throw new Error(`Printful API request failed with status ${response.status}`);
+    }
+
+    return response.json();
+}
+
+/**
+ * Fetches details for a specific catalog product.
+ * @param {string|number} productId - The Printful Product ID.
+ * @param {string} apiKey - The Printful API key.
+ * @returns {Promise<object>} - The product data.
+ */
+export async function getPrintfulProduct(productId, apiKey) {
+    console.log(`Fetching Printful product ${productId}...`);
+    return fetchPrintfulAPI(`/catalog-products/${productId}`, apiKey);
+}
+
+/**
+ * Fetches all variants for a specific catalog product.
+ * Note: This currently fetches *all* variants. Printful API v2 doesn't seem to support filtering variants by color/size in this specific call.
+ * We will filter them after fetching.
+ * @param {string|number} productId - The Printful Product ID.
+ * @param {string} apiKey - The Printful API key.
+ * @returns {Promise<Array<object>>} - An array of variant data objects.
+ */
+export async function getPrintfulProductVariants(productId, apiKey) {
+    console.log(`Fetching Printful variants for product ${productId}...`);
+    // Need to handle potential pagination if a product has >100 variants, but 586 has 315. Default limit seems to be 20?
+    // Let's fetch a larger limit for now. For robust solution, would need pagination loop.
+    const result = await fetchPrintfulAPI(`/catalog-products/${productId}/catalog-variants?limit=100`, apiKey); // Fetch first 100
+    let allVariants = result.data;
+
+    // Basic pagination check (assuming 'next' link exists if more pages)
+    let nextUrl = result._links?.next?.href;
+    let safetyCounter = 0; // Prevent infinite loops
+    const MAX_PAGES = 10;
+
+    while (nextUrl && safetyCounter < MAX_PAGES) {
+        console.log(`Fetching next page of variants: ${nextUrl}...`);
+        // Need to strip the base URL from the next link provided by Printful
+        const endpoint = nextUrl.replace(BASE_URL, '');
+        const nextPageResult = await fetchPrintfulAPI(endpoint, apiKey);
+        if (nextPageResult.data?.length > 0) {
+            allVariants = allVariants.concat(nextPageResult.data);
+        }
+        nextUrl = nextPageResult._links?.next?.href;
+        safetyCounter++;
+    }
+    if (safetyCounter === MAX_PAGES) {
+        console.warn(`Reached max pagination limit (${MAX_PAGES}) for variants on product ${productId}. May be incomplete.`);
+    }
+
+    console.log(`Fetched total ${allVariants.length} variants for product ${productId}.`);
+    return allVariants; 
+}
+
+/**
+ * Fetches stock availability for a specific catalog product.
+ * @param {string|number} productId - The Printful Product ID.
+ * @param {string} apiKey - The Printful API key.
+ * @returns {Promise<Array<object>>} - Availability data per variant/technique/region.
+ */
+export async function getPrintfulProductAvailability(productId, apiKey) {
+    console.log(`Fetching Printful availability for product ${productId}...`);
+    // Again, potentially need pagination for products with many variants
+    const result = await fetchPrintfulAPI(`/catalog-products/${productId}/availability?limit=100`, apiKey);
+    let allAvailability = result.data;
+
+    let nextUrl = result._links?.next?.href;
+    let safetyCounter = 0;
+    const MAX_PAGES = 10;
+
+    while (nextUrl && safetyCounter < MAX_PAGES) {
+        console.log(`Fetching next page of availability: ${nextUrl}...`);
+        const endpoint = nextUrl.replace(BASE_URL, '');
+        const nextPageResult = await fetchPrintfulAPI(endpoint, apiKey);
+        if (nextPageResult.data?.length > 0) {
+            allAvailability = allAvailability.concat(nextPageResult.data);
+        }
+        nextUrl = nextPageResult._links?.next?.href;
+        safetyCounter++;
+    }
+     if (safetyCounter === MAX_PAGES) {
+        console.warn(`Reached max pagination limit (${MAX_PAGES}) for availability on product ${productId}. May be incomplete.`);
+    }
+
+    console.log(`Fetched availability for ${allAvailability.length} variant entries for product ${productId}.`);
+    return allAvailability;
+}
+
+/**
+ * Fetches product pricing information from Printful API v2.
+ * @param {string|number} productId - The Printful Product ID.
+ * @param {string} apiKey - The Printful API Key.
+ * @param {string} currency - Optional currency code (e.g., 'USD'). Uses store default if omitted.
+ * @returns {Promise<object>} - The pricing data object.
+ */
+export async function getPrintfulProductPrices(productId, apiKey, currency = 'USD') {
+    const initialEndpoint = `/catalog-products/${productId}/prices?currency=${currency}&limit=100`;
+
+    console.log(`Fetching initial page of Printful prices for product ${productId} in ${currency}...`);
+    const initialResult = await fetchPrintfulAPI(initialEndpoint, apiKey);
+
+    if (!initialResult || !initialResult.data || !initialResult.data.variants) {
+        console.warn(`No pricing data or variants found in initial pricing response for product ${productId}`);
+        return initialResult.data || {};
+    }
+
+    let allVariants = initialResult.data.variants;
+    let nextUrl = initialResult._links?.next?.href;
+    let safetyCounter = 0;
+    const MAX_PAGES = 15;
+
+    while (nextUrl && safetyCounter < MAX_PAGES) {
+        console.log(`Fetching next page of prices: ${nextUrl}...`);
+        const endpoint = nextUrl.replace(BASE_URL, '');
+        try {
+            const nextPageResult = await fetchPrintfulAPI(endpoint, apiKey);
+            if (nextPageResult.data?.variants?.length > 0) {
+                allVariants = allVariants.concat(nextPageResult.data.variants);
+            }
+            nextUrl = nextPageResult._links?.next?.href;
+        } catch (error) {
+            console.error(`Error fetching next page of prices (${nextUrl}):`, error);
+            break;
+        }
+        safetyCounter++;
+    }
+
+    if (safetyCounter === MAX_PAGES) {
+        console.warn(`Reached max pagination limit (${MAX_PAGES}) for prices on product ${productId}. May be incomplete.`);
+    }
+
+    console.log(`Fetched pricing for total ${allVariants.length} variants for product ${productId}.`);
+
+    const finalData = initialResult.data;
+    finalData.variants = allVariants;
+    return finalData;
+}
+
+// New function to fetch mockup templates
+export async function getPrintfulMockupTemplates(productId, apiKey, placement = null) {
+    if (!apiKey) throw new Error('PRINTFUL_API_KEY is not set.');
+
+    const url = new URL(`https://api.printful.com/v2/catalog-products/${productId}/mockup-templates`);
+    if (placement) {
+        url.searchParams.append('placements', placement);
+    }
+    // We might need pagination handling here if a product has many templates
+    // For now, assume the first page is sufficient or Printful returns all for one placement.
+    url.searchParams.append('limit', '100'); // Fetch up to 100 templates
+
+    const headers = {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+    };
+
+    try {
+        const response = await fetch(url.toString(), { method: 'GET', headers });
+        if (!response.ok) {
+            let errorBody = 'Could not read error body';
+            try {
+                errorBody = await response.json();
+            } catch (e) { /* ignore */ }
+            console.error(`Printful API Error (${response.status}) for ${url.pathname}:`, errorBody);
+            throw new Error(`Failed to fetch mockup templates: ${response.status} ${response.statusText}`);
+        }
+        const result = await response.json();
+        return result.data || []; // Return the data array or empty if missing
+    } catch (error) {
+        console.error('Error fetching Printful mockup templates:', error);
+        throw error;
+    }
+}
+
+/**
+ * Downloads an image from a URL.
+ * @param {string} imageUrl The URL of the image to download.
+ * @returns {Promise<{arrayBuffer: ArrayBuffer, contentType: string | null}>} The image data and content type.
+ * @throws {Error} If the download fails or the response is not an image.
+ */
+export async function downloadImage(imageUrl) {
+  try {
+    console.log(`Downloading image: ${imageUrl}`);
+    const response = await fetch(imageUrl);
+    if (!response.ok) {
+      throw new Error(`Failed to download image ${imageUrl}: ${response.status} ${response.statusText}`);
+    }
+
+    const contentType = response.headers.get('content-type');
+    if (!contentType || !contentType.startsWith('image/')) {
+        // Try to infer from URL extension if header is missing/wrong
+        const extension = imageUrl.split('.').pop()?.toLowerCase();
+        if (!['png', 'jpg', 'jpeg', 'gif', 'webp'].includes(extension)) {
+             throw new Error(`Downloaded content from ${imageUrl} is not an image (Content-Type: ${contentType}, URL: ${imageUrl})`);
+        }
+         console.warn(`Missing or invalid image Content-Type (${contentType}) for ${imageUrl}. Proceeding based on extension.`);
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    console.log(`Downloaded ${imageUrl} (${(arrayBuffer.byteLength / 1024).toFixed(1)} KB)`);
+    return { arrayBuffer, contentType };
+
+  } catch (error) {
+    console.error(`Error in downloadImage for ${imageUrl}:`, error);
+    throw error; // Re-throw the error to be handled by the caller
+  }
+}
+</file>
+
+<file path="src/scheduled.js">
+import {
+    getPrintfulProductAvailability,
+    getPrintfulProductPrices
+} from './printful';
+
+/**
+ * Updates the inventory count and base price for variants of a given product.
+ * @param {object} env - Worker environment object.
+ * @param {number} dbProductId - The database ID of the product.
+ * @param {string} printfulProductId - The Printful Product ID.
+ */
+async function updateProductVariants(env, dbProductId, printfulProductId) {
+    console.log(`Updating variants for Product ID: ${dbProductId} (Printful ID: ${printfulProductId})`);
+    const apiKey = env.PRINTFUL_API_KEY;
+    if (!apiKey || !env.DB) {
+        console.error(`Missing API Key or DB binding for product ${printfulProductId}`);
+        return; // Skip this product if config is missing
+    }
+
+    const DEFAULT_INVENTORY = 100; // Match the seed script default
+    const TARGET_TECHNIQUE = 'dtg';
+    const TARGET_REGIONS = ['usa', 'europe']; // Match seed script
+
+    try {
+        // 1. Fetch latest data from Printful
+        const [allAvailability, pricingData] = await Promise.all([
+            getPrintfulProductAvailability(printfulProductId, apiKey),
+            getPrintfulProductPrices(printfulProductId, apiKey, 'USD') // Fetch USD prices
+        ]).catch(err => {
+            console.error(`Failed to fetch Printful data for ${printfulProductId}:`, err);
+            return [null, null]; // Allow function to continue to next product
+        });
+
+        if (!allAvailability || !pricingData) {
+            console.log(`Skipping update for ${printfulProductId} due to fetch error.`);
+            return;
+        }
+
+        // 2. Process Printful data into maps
+        // Availability Map: variantId -> { isAvailable, isInStock }
+        const availabilityMap = allAvailability.reduce((map, avail) => {
+            const dtgTechniqueAvailability = avail.techniques?.find(t => t.technique === TARGET_TECHNIQUE);
+            if (dtgTechniqueAvailability) {
+                const isInStock = dtgTechniqueAvailability.selling_regions?.some(r => TARGET_REGIONS.includes(r.name) && r.availability === 'in stock');
+                map[avail.catalog_variant_id] = {
+                    isAvailable: true,
+                    isInStock: isInStock
+                };
+            }
+            return map;
+        }, {});
+
+        // Price Map: variantId -> price (float)
+        const priceMap = {};
+        if (pricingData && pricingData.variants) {
+            pricingData.variants.forEach(variantPriceInfo => {
+                const dtgTechnique = variantPriceInfo.techniques?.find(t => t.technique_key === TARGET_TECHNIQUE);
+                if (dtgTechnique && dtgTechnique.price) {
+                    priceMap[variantPriceInfo.id] = parseFloat(dtgTechnique.price);
+                }
+            });
+        }
+
+        // 3. Combine into update data: variant_sku -> { new_inventory, new_price }
+        // We use variant_sku (Printful variant ID) as the key
+        const updateDataMap = {};
+        Object.keys(availabilityMap).forEach(variantIdStr => {
+            const variantId = parseInt(variantIdStr, 10);
+            const availability = availabilityMap[variantId];
+            const price = priceMap[variantId]; // Already parsed to float or undefined
+
+            if (availability) { // Only update variants we have availability info for
+                updateDataMap[variantId] = {
+                    new_inventory: availability.isInStock ? DEFAULT_INVENTORY : 0,
+                    new_price: price !== undefined ? price : null // Store null if price wasn't found
+                };
+            }
+        });
+
+        if (Object.keys(updateDataMap).length === 0) {
+             console.log(`No relevant variant data found from Printful for product ${printfulProductId}. Skipping D1 update.`);
+             return;
+        }
+
+        // 4. Prepare D1 Update Statements
+        const updateStmt = env.DB.prepare(
+            `UPDATE product_variants
+             SET inventory_count = ?, printful_price = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE product_id = ? AND variant_sku = ?`
+        );
+
+        const updateBindings = Object.entries(updateDataMap).map(([variantSku, data]) => {
+            console.log(`  - Preparing update for SKU ${variantSku}: Inv=${data.new_inventory}, Price=${data.new_price}`);
+            return updateStmt.bind(data.new_inventory, data.new_price, dbProductId, variantSku);
+        });
+
+        // 5. Batch Update D1
+        console.log(`Batch updating ${updateBindings.length} variants in D1 for product ${dbProductId}...`);
+        const batchResult = await env.DB.batch(updateBindings);
+        console.log(`Batch update complete for product ${dbProductId}. Results:`, JSON.stringify(batchResult));
+
+    } catch (error) {
+        console.error(`Unhandled error updating product ${printfulProductId}:`, error);
+        // Optionally, rethrow or handle differently
+    }
+}
+
+/**
+ * Scheduled event handler.
+ */
+export async function handleScheduled(event, env, ctx) {
+    console.log(`Scheduled task started at: ${new Date(event.scheduledTime).toISOString()}`);
+
+    try {
+        // Get all products we manage
+        const { results: productsToUpdate } = await env.DB.prepare(
+            `SELECT id, printful_product_id FROM products WHERE status = 'active'`
+        ).all();
+
+        if (!productsToUpdate || productsToUpdate.length === 0) {
+            console.log("No active products found to update.");
+            return;
+        }
+
+        console.log(`Found ${productsToUpdate.length} active products to check for updates.`);
+
+        // Update each product sequentially to avoid overwhelming Printful API/D1
+        // For many products, consider a queue or staggering updates.
+        for (const product of productsToUpdate) {
+            // Use waitUntil to allow the function to finish while updates happen
+            ctx.waitUntil(updateProductVariants(env, product.id, product.printful_product_id));
+            // Optional: Add a small delay between products if rate limiting becomes an issue
+            // await new Promise(resolve => setTimeout(resolve, 500)); 
+        }
+
+        console.log("Scheduled task finished initiating updates.");
+
+    } catch (error) {
+        console.error("Error during scheduled task:", error);
+        // Consider reporting this error externally
+    }
+}
+</file>
+
+<file path="src/seed.js">
+import {
+    getPrintfulProduct,
+    getPrintfulProductVariants,
+    getPrintfulProductAvailability,
+    getPrintfulProductPrices,
+    getPrintfulMockupTemplates,
+    downloadImage
+} from './printful';
+
+/**
+ * Generates a URL-friendly slug from a string.
+ * @param {string} text
+ * @returns {string}
+ */
+function generateSlug(text) {
+    return text
+        .toString()
+        .normalize('NFD') // split accented characters into their base characters and diacritical marks
+        .replace(/[\u0300-\u036f]/g, '') // remove diacritical marks
+        .toLowerCase()
+        .trim()
+        .replace(/\s+/g, '-') // replace spaces with -
+        .replace(/[^\w-]+/g, '') // remove all non-word chars except -
+        .replace(/--+/g, '-'); // replace multiple - with single -
+}
+
+/**
+ * Fetches product data from Printful, filters it, and seeds the D1 database.
+ * @param {object} env - The Worker environment (contains DB, PRINTFUL_API_KEY).
+ * @param {string|number} productId - The Printful Product ID to seed.
+ * @param {Array<string>} targetColors - List of color names to include.
+ * @returns {Promise<object>} - A summary of the operation.
+ */
+export async function seedProductData(env, productId, targetColors) {
+    const apiKey = env.PRINTFUL_API_KEY;
+    const db = env.DB;
+    if (!apiKey || !db || !env.R2_BUCKET || !env.R2_PUBLIC_URL) {
+        console.error('Missing environment variables: PRINTFUL_API_KEY, DB binding, R2_BUCKET binding, or R2_PUBLIC_URL');
+        return { success: false, message: 'Missing required environment configuration for seeding.' };
+    }
+
+    const targetColorsLower = targetColors ? targetColors.map(c => c.toLowerCase()) : []; // Ensure array even if null/undefined
+    const DEFAULT_INVENTORY = 100; // Assign this if Printful says 'in stock'
+    const TARGET_TECHNIQUE = 'dtg'; // This might need adjustment for non-DTG products like stickers (digital)
+    const TARGET_REGIONS = ['usa', 'europe'];
+
+    try {
+        // 1. Fetch Product data first to determine type and placement
+        console.log(`Fetching product data for Printful product ${productId}...`);
+        const productData = await getPrintfulProduct(productId, apiKey);
+        const productName = productData.data?.name;
+        const productType = productData.data?.type; // e.g., 'T-SHIRT', 'STICKER'
+        const productTechniqueKey = productData.data?.techniques?.find(t => t.is_default)?.key || 'digital'; // Use default or fallback
+        
+        if (!productName || !productType) {
+            return { success: false, message: `Product ${productId} not found or critical data (name, type) is missing.` };
+        }
+        console.log(`Fetched product: ${productName} (Type: ${productType}, Default Technique: ${productTechniqueKey})`);
+
+        // Determine the placement to fetch templates for
+        const placementToFetch = productType === 'STICKER' ? 'default' : 'front';
+        console.log(`Using placement '${placementToFetch}' for fetching templates based on product type.`);
+
+        // Fetch remaining data
+        console.log(`Fetching variants, availability, prices, and templates for Printful product ${productId}...`);
+        const [allVariants, allAvailability, pricingData, mockupTemplates] = await Promise.all([
+            getPrintfulProductVariants(productId, apiKey),
+            getPrintfulProductAvailability(productId, apiKey),
+            getPrintfulProductPrices(productId, apiKey, 'USD'),
+            getPrintfulMockupTemplates(productId, apiKey, placementToFetch) // Use determined placement
+        ]);
+        console.log(`Fetched Printful data: ${allVariants.length} variants, ${mockupTemplates.length} templates for ${placementToFetch}.`);
+
+        console.log(`Fetched ${allVariants.length} variants.`);
+        console.log(`Fetched availability for ${allAvailability.length} entries.`);
+        console.log(`Fetched pricing data.`);
+        console.log(`Fetched ${mockupTemplates.length} mockup templates for '${placementToFetch}'.`);
+
+        // --- Process Mockup Templates & Upload Images ---
+        let commonTemplateData = null;
+        const variantTextureR2UrlMap = {}; // { printful_variant_id: r2_texture_url }
+        const uniqueImageUrlsToUpload = new Map(); // <printful_url, { hash, extension, r2_url }>
+
+        if (mockupTemplates.length > 0) {
+            const firstTemplate = mockupTemplates[0];
+
+            // Process common overlay image URL
+            if (firstTemplate.image_url) {
+                if (!uniqueImageUrlsToUpload.has(firstTemplate.image_url)) {
+                    const urlHash = await sha256(firstTemplate.image_url);
+                    const extension = firstTemplate.image_url.split('.').pop()?.split('?')[0] || 'png'; // Basic extension guess
+                    uniqueImageUrlsToUpload.set(firstTemplate.image_url, { hash: urlHash, extension, r2_url: null });
+                }
+            }
+
+            // Process background/texture URLs
+            for (const template of mockupTemplates) {
+                if (template.background_url && !uniqueImageUrlsToUpload.has(template.background_url)) {
+                    const urlHash = await sha256(template.background_url);
+                    const extension = template.background_url.split('.').pop()?.split('?')[0] || 'jpg';
+                    uniqueImageUrlsToUpload.set(template.background_url, { hash: urlHash, extension, r2_url: null });
+                }
+            }
+
+            console.log(`Identified ${uniqueImageUrlsToUpload.size} unique template images to process.`);
+
+            // Download and upload unique images in parallel
+            const uploadPromises = [];
+            for (const [printfulUrl, imageData] of uniqueImageUrlsToUpload.entries()) {
+                uploadPromises.push(
+                    (async () => {
+                        try {
+                            const { arrayBuffer, contentType } = await downloadImage(printfulUrl);
+                            
+                            // --- Generate readable filename from URL path ---
+                            const urlPath = new URL(printfulUrl).pathname;
+                            let filename = urlPath.substring(urlPath.lastIndexOf('/') + 1);
+                            // Clean filename (remove query params just in case, though URL obj should handle it)
+                            filename = filename.split('?')[0]; 
+                            // Basic sanitization (replace potential problematic chars, though unlikely needed for Printful URLs)
+                            filename = filename.replace(/[^a-zA-Z0-9_.-]/g, '_'); 
+                            if (!filename) { // Fallback if extraction fails
+                                filename = `template_${imageData.hash}.${imageData.extension}`;
+                                console.warn(`Could not extract filename from ${printfulUrl}, using hash fallback: ${filename}`);
+                            }
+                            // --------------------------------------------------
+
+                            // Pass productId to uploadToR2
+                            imageData.r2_url = await uploadToR2(env, productId, filename, arrayBuffer, contentType); // Use new filename
+                            uniqueImageUrlsToUpload.set(printfulUrl, imageData); // Update map with R2 URL
+                        } catch (uploadError) {
+                            console.error(`Failed to process image ${printfulUrl}: ${uploadError.message}`);
+                            // Decide how to handle failures - skip this image? Fail the seed?
+                            // For now, we log and continue, variants needing this image will have null URL.
+                        }
+                    })()
+                );
+            }
+            await Promise.all(uploadPromises);
+            console.log("Finished processing template image uploads.");
+
+            // Now build the final data using the R2 URLs
+            const commonOverlayR2Url = uniqueImageUrlsToUpload.get(firstTemplate.image_url)?.r2_url || null;
+            commonTemplateData = {
+                template_image_url: commonOverlayR2Url,
+                template_width: firstTemplate.template_width,
+                template_height: firstTemplate.template_height,
+                print_area_width: firstTemplate.print_area_width,
+                print_area_height: firstTemplate.print_area_height,
+                print_area_top: firstTemplate.print_area_top,
+                print_area_left: firstTemplate.print_area_left,
+            };
+            console.log("Common Template Data (using R2 URLs) extracted.");
+
+            // Map texture R2 URLs to variants
+            for (const template of mockupTemplates) {
+                if (template.background_url) {
+                    const textureR2Url = uniqueImageUrlsToUpload.get(template.background_url)?.r2_url || null;
+                    if (textureR2Url) {
+                        for (const variantId of template.catalog_variant_ids) {
+                            variantTextureR2UrlMap[variantId] = textureR2Url;
+                        }
+                    }
+                }
+            }
+            console.log(`Mapped ${Object.keys(variantTextureR2UrlMap).length} variants with R2 texture URLs.`);
+
+        } else {
+            console.warn(`No mockup templates found for product ${productId}, placement ${placementToFetch}. Template fields will be null.`);
+        }
+        // -------------------------------------------
+
+        // Create availability map - adjust technique based on product?
+        // Using productTechniqueKey fetched earlier instead of hardcoded TARGET_TECHNIQUE
+        const availabilityMap = allAvailability.reduce((map, avail) => {
+            const techniqueAvailability = avail.techniques?.find(t => t.technique === productTechniqueKey);
+            if (techniqueAvailability) {
+                const isInStock = techniqueAvailability.selling_regions?.some(r => TARGET_REGIONS.includes(r.name) && r.availability === 'in stock');
+                map[avail.catalog_variant_id] = {
+                    isAvailable: true,
+                    isInStock: isInStock
+                };
+            }
+            return map;
+        }, {});
+
+        // Create price map - adjust technique based on product?
+        // Using productTechniqueKey instead of hardcoded TARGET_TECHNIQUE
+        const priceMap = {};
+        if (pricingData && pricingData.variants) {
+            pricingData.variants.forEach(variantPriceInfo => {
+                const techniquePrice = variantPriceInfo.techniques?.find(t => t.technique_key === productTechniqueKey);
+                if (techniquePrice && techniquePrice.price) {
+                    priceMap[variantPriceInfo.id] = techniquePrice.price;
+                }
+            });
+            console.log(`Created price map for ${Object.keys(priceMap).length} variants using technique '${productTechniqueKey}'.`);
+        } else {
+            console.warn(`No pricing data or variants found in pricing response for product ${productId}`);
+        }
+
+        // ---> ADDED: Truncate Name at first '|'
+        let processedProductName = productName;
+        const pipeIndex = processedProductName.indexOf('|');
+        if (pipeIndex !== -1) {
+            processedProductName = processedProductName.substring(0, pipeIndex).trim();
+        }
+        // <---
+
+        // 2. Process and Filter Variants
+        const apparelSizes = ['S', 'M', 'L', 'XL']; // Sizes typically for apparel
+        console.log(`Filtering variants. Target Colors: ${targetColorsLower.length > 0 ? targetColorsLower.join(', ') : '[All]'}. Applying size filter only for non-sticker types.`);
+        
+        const filteredVariants = allVariants.filter(variant => {
+            // Availability Check (required for all)
+            const isAvailable = availabilityMap[variant.id]?.isAvailable;
+            if (!isAvailable) return false;
+
+            // Color Filter (only if targetColors specified)
+            if (targetColorsLower.length > 0) {
+                const colorNameLower = variant.color?.toLowerCase();
+                if (!colorNameLower || !targetColorsLower.includes(colorNameLower)) {
+                    return false;
+                }
+            }
+
+            // Size Filter (only for non-sticker types, using apparelSizes for now)
+            if (productType !== 'STICKER') {
+                 if (!variant.size || !apparelSizes.includes(variant.size)) {
+                     return false;
+                 }
+            }
+            // If we passed all applicable filters, include the variant
+            return true;
+        }).map(variant => ({
+            printful_variant_id: variant.id,
+            printful_product_id: variant.catalog_product_id,
+            size: variant.size,
+            color_name: variant.color,
+            color_code: variant.color_code,
+            printful_price: priceMap[variant.id] ? parseFloat(priceMap[variant.id]) : null,
+            inventory_count: availabilityMap[variant.id]?.isInStock ? DEFAULT_INVENTORY : 0,
+            template_image_url: commonTemplateData?.template_image_url || null,
+            template_texture_url: variantTextureR2UrlMap[variant.id] || null,
+            template_width: commonTemplateData?.template_width || null,
+            template_height: commonTemplateData?.template_height || null,
+            print_area_width: commonTemplateData?.print_area_width || null,
+            print_area_height: commonTemplateData?.print_area_height || null,
+            print_area_top: commonTemplateData?.print_area_top || null,
+            print_area_left: commonTemplateData?.print_area_left || null,
+            status: availabilityMap[variant.id]?.isInStock ? 'available' : 'out_of_stock'
+        }));
+
+        if (filteredVariants.length === 0) {
+            // Add more context to the error message
+            return { success: false, message: `No variants found matching criteria for product ${productId} (Type: ${productType}). Check availability, color filters (if used), and size filters (if applicable).` };
+        }
+        console.log(`Found ${filteredVariants.length} variants to seed after filtering.`);
+
+        // 3. Prepare for D1
+        // Slug generation - Make it more generic?
+        // Let's use productId in slug for non-586 cases for now
+        let productSlug;
+        if (productId.toString() === '586') {
+            productSlug = 'unisex-t-shirt';
+            console.log(`Using hardcoded slug '${productSlug}' for Printful Product ID ${productId}`);
+        } else {
+            // Generic slug: type-id or name-id
+            productSlug = generateSlug(`${productType}-${productId}`); // Use type and ID for uniqueness
+            console.log(`Generated slug '${productSlug}' for Printful Product ID ${productId}`);
+        }
+        
+        const productInsertStmt = db.prepare(
+            'INSERT INTO products (name, slug, printful_product_id, status) VALUES (?, ?, ?, ?) ON CONFLICT(printful_product_id) DO UPDATE SET name=excluded.name, slug=excluded.slug, status=excluded.status, updated_at=CURRENT_TIMESTAMP RETURNING id'
+        );
+
+        // Corrected SQL Statement
+        const variantUpsertStmt = db.prepare(`
+            INSERT INTO product_variants (
+                product_id, printful_variant_id, printful_product_id, color_name, color_code,
+                size, printful_price, inventory_count, status,
+                template_image_url, template_texture_url, template_width, template_height,
+                print_area_width, print_area_height, print_area_top, print_area_left
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(printful_variant_id) DO UPDATE SET
+                product_id = excluded.product_id,
+                printful_product_id = excluded.printful_product_id,
+                color_name = excluded.color_name,
+                color_code = excluded.color_code,
+                size = excluded.size,
+                printful_price = excluded.printful_price,
+                inventory_count = excluded.inventory_count,
+                status = excluded.status,
+                template_image_url = excluded.template_image_url,
+                template_texture_url = excluded.template_texture_url,
+                template_width = excluded.template_width,
+                template_height = excluded.template_height,
+                print_area_width = excluded.print_area_width,
+                print_area_height = excluded.print_area_height,
+                print_area_top = excluded.print_area_top,
+                print_area_left = excluded.print_area_left,
+                updated_at = CURRENT_TIMESTAMP
+        `);
+
+        // 4. Execute D1 Queries
+        console.log(`Inserting/Updating product: ${processedProductName} (Slug: ${productSlug})`);
+        const productResult = await productInsertStmt.bind(processedProductName, productSlug, productId, 'active').first();
+
+        if (!productResult?.id) {
+            throw new Error('Failed to insert or retrieve product ID from D1.');
+        }
+        const dbProductId = productResult.id;
+
+        // Batch insert/update variants
+        const variantBindings = filteredVariants.map(v =>
+            variantUpsertStmt.bind(
+                dbProductId, v.printful_variant_id, v.printful_product_id, v.color_name, v.color_code,
+                v.size, v.printful_price, v.inventory_count, v.status,
+                v.template_image_url, v.template_texture_url, v.template_width, v.template_height,
+                v.print_area_width, v.print_area_height, v.print_area_top, v.print_area_left
+            )
+        );
+
+        console.log(`Batch inserting/updating ${variantBindings.length} variants...`);
+        const batchResult = await db.batch(variantBindings);
+
+        console.log('D1 Batch Result Summary:', batchResult.map(r => ({ success: r.success, error: r.error })));
+        const successCount = batchResult.filter(r => r.success).length;
+        const failedCount = batchResult.length - successCount;
+
+        if (failedCount > 0) {
+            console.error(`Failed to insert/update ${failedCount} variants.`);
+            // Optionally log more details about failures if needed
+        }
+
+        return {
+            success: true, // Indicate overall process attempted
+            message: `Seeded product ${productId} (${processedProductName}) with ID ${dbProductId}. Processed ${filteredVariants.length} variants (Succeeded: ${successCount}, Failed: ${failedCount}).`,
+            productId: dbProductId,
+            variantsProcessed: filteredVariants.length,
+            variantsSucceeded: successCount
+        };
+
+    } catch (error) {
+        console.error('Error during product seeding:', error);
+        if (error.cause) {
+            console.error('Caused by:', error.cause);
+        }
+        return { success: false, message: `Seeding failed: ${error.message}` };
+    }
+}
+
+const TARGET_PRINTFUL_PRODUCT_ID = 586; // Comfort Colors 1717
+const TARGET_COLORS = [ // From Frontend Day 1 Standup
+  'Berry', 'Black', 'Blue Jean', 'Brick',
+  'Grey', 'Moss', 'True Navy', 'White',
+];
+const TARGET_SIZES = ['S', 'M', 'L', 'XL']; // Defined in Backend Day 2 Standup
+const TARGET_TECHNIQUE = 'dtg'; // Defined in Backend Day 1 Standup
+
+async function seedDatabase(db, env) {
+  console.log(`Starting seed process for Printful Product ID: ${TARGET_PRINTFUL_PRODUCT_ID}...`);
+
+  try {
+    // --- 1. Fetch Product Info ---
+    // (Keep existing product fetching logic if necessary, or simplify if only one product is needed)
+    // For MVP, we assume product 'Comfort Colors 1717' (ID 586) is already in DB or we create it here.
+    // Ensure the base product exists
+    const productName = "Unisex Garment-Dyed Heavyweight T-Shirt"; // Name for Comfort Colors 1717
+    const productSlug = "comfort-colors-1717"; // Example slug
+    let productResult = await db.prepare("SELECT id FROM products WHERE printful_product_id = ?")
+                                 .bind(TARGET_PRINTFUL_PRODUCT_ID).first();
+
+    let productId;
+    if (!productResult) {
+      console.log(`Product ${TARGET_PRINTFUL_PRODUCT_ID} not found, inserting...`);
+      const insertResult = await db.prepare(
+        "INSERT INTO products (printful_product_id, name, slug, status) VALUES (?, ?, ?, 'active') RETURNING id"
+      ).bind(TARGET_PRINTFUL_PRODUCT_ID, productName, productSlug).first();
+      productId = insertResult.id;
+      console.log(`Inserted product with ID: ${productId}`);
+    } else {
+      productId = productResult.id;
+      console.log(`Found existing product with ID: ${productId}`);
+    }
+
+    // --- 2. Fetch Variants & Prices ---
+    console.log('Fetching variants from Printful...');
+    const allVariants = await getPrintfulProductVariants(TARGET_PRINTFUL_PRODUCT_ID, env.PRINTFUL_API_KEY);
+    console.log(`Fetched ${allVariants.length} total variants.`);
+
+    console.log('Fetching prices from Printful...');
+    const variantPrices = await getPrintfulProductPrices(TARGET_PRINTFUL_PRODUCT_ID, env.PRINTFUL_API_KEY); // Assuming this returns a map { printful_variant_id: price }
+    console.log(`Fetched prices for ${Object.keys(variantPrices).length} variants.`);
+
+    // --- 3. Fetch Mockup Template Data ---
+    console.log('Fetching mockup template data (front placement) from Printful...');
+    const mockupTemplates = await getPrintfulMockupTemplates(TARGET_PRINTFUL_PRODUCT_ID, env.PRINTFUL_API_KEY, 'front');
+    console.log(`Fetched ${mockupTemplates.length} template definitions for 'front' placement.`);
+
+    if (mockupTemplates.length === 0) {
+      console.warn("Warning: No mockup template data found for 'front' placement. Cannot populate template/print area columns.");
+      // Decide how to proceed: skip populating these fields or throw error? For now, skip.
+    }
+
+    // Process template data into a usable format
+    // We need: common overlay image, boundaries, and variant-specific texture URLs
+    let commonTemplateData = null;
+    const variantTextureMap = {}; // { printful_variant_id: texture_url }
+
+    if (mockupTemplates.length > 0) {
+        // Assume the first template has the common data we need (boundaries, overlay image)
+        const firstTemplate = mockupTemplates[0];
+        commonTemplateData = {
+            template_image_url: firstTemplate.image_url,
+            template_width: firstTemplate.template_width,
+            template_height: firstTemplate.template_height,
+            print_area_width: firstTemplate.print_area_width,
+            print_area_height: firstTemplate.print_area_height,
+            print_area_top: firstTemplate.print_area_top,
+            print_area_left: firstTemplate.print_area_left,
+        };
+        console.log("Common Template Data:", commonTemplateData);
+
+        // Map texture URLs to variants that use them
+        for (const template of mockupTemplates) {
+            if (template.background_url) {
+                for (const variantId of template.catalog_variant_ids) {
+                    variantTextureMap[variantId] = template.background_url;
+                }
+            }
+        }
+        console.log(`Mapped ${Object.keys(variantTextureMap).length} variants with specific texture URLs.`);
+    }
+
+
+    // --- 4. Filter and Insert/Update Variants ---
+    const variantsToSeed = allVariants.filter(variant =>
+      TARGET_COLORS.includes(variant.color) &&
+      TARGET_SIZES.includes(variant.size) &&
+      variantPrices[variant.id] !== undefined // Ensure we have a price
+      // Add technique filtering if available in variant data, otherwise assume DTG for this product
+    );
+
+    console.log(`Filtered down to ${variantsToSeed.length} variants matching target colors/sizes/price.`);
+
+    if (variantsToSeed.length === 0) {
+      console.warn('Warning: No variants matched the filtering criteria. Check TARGET_COLORS, TARGET_SIZES, and Printful data.');
+      return { success: false, message: 'No matching variants found to seed.' };
+    }
+
+    // Prepare batch insert/update statement
+    const stmt = db.prepare(`
+      INSERT INTO product_variants (
+        product_id, printful_variant_id, printful_product_id, color_name,
+        color_code, size, printful_price, inventory_count, status,
+        template_image_url, template_texture_url, template_width, template_height,
+        print_area_width, print_area_height, print_area_top, print_area_left
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(printful_variant_id) DO UPDATE SET
+        product_id = excluded.product_id,
+        printful_product_id = excluded.printful_product_id,
+        color_name = excluded.color_name,
+        color_code = excluded.color_code,
+        size = excluded.size,
+        printful_price = excluded.printful_price,
+        inventory_count = excluded.inventory_count, -- Or fetch live inventory here
+        status = excluded.status,
+        template_image_url = excluded.template_image_url,
+        template_texture_url = excluded.template_texture_url,
+        template_width = excluded.template_width,
+        template_height = excluded.template_height,
+        print_area_width = excluded.print_area_width,
+        print_area_height = excluded.print_area_height,
+        print_area_top = excluded.print_area_top,
+        print_area_left = excluded.print_area_left,
+        updated_at = CURRENT_TIMESTAMP
+    `);
+
+    const batchData = variantsToSeed.map(variant => {
+        const price = variantPrices[variant.id];
+        const templateData = commonTemplateData || {}; // Use empty object if no template data fetched
+        const textureUrl = variantTextureMap[variant.id] || null;
+        const inventoryCount = 100; // Placeholder inventory
+        const status = 'available'; // Placeholder status
+
+        return stmt.bind(
+            productId,
+            variant.id,
+            TARGET_PRINTFUL_PRODUCT_ID, // Assuming variant.catalog_product_id exists, or use constant
+            variant.color,
+            variant.color_code || '#000000', // Default color code if missing
+            variant.size,
+            price,
+            inventoryCount,
+            status,
+            templateData.template_image_url || null,
+            textureUrl,
+            templateData.template_width || null,
+            templateData.template_height || null,
+            templateData.print_area_width || null,
+            templateData.print_area_height || null,
+            templateData.print_area_top || null,
+            templateData.print_area_left || null
+        );
+    });
+
+    console.log(`Executing batch insert/update for ${batchData.length} variants...`);
+    await db.batch(batchData);
+    console.log('Batch insert/update complete.');
+
+    console.log('Seed process finished successfully.');
+    return { success: true, message: `Seeded/Updated ${batchData.length} variants for product ID ${productId}.` };
+
+  } catch (error) {
+    console.error('Error during seeding process:', error);
+    if (error.cause) {
+        console.error('Caused by:', error.cause);
+    }
+    // Attempt to log D1 specific errors if available
+     if (error.message && error.message.includes('D1_ERROR')) {
+       console.error('D1 Error details:', error);
+     }
+    return { success: false, message: `Seeding failed: ${error.message}` };
+  }
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    if (request.method === 'POST' && url.pathname === '/api/admin/seed-product') {
+        // Simple security check (replace with proper auth later)
+        if (request.headers.get('X-Admin-Secret') !== env.ADMIN_AUTH_KEY) {
+            return new Response('Unauthorized', { status: 401 });
+        }
+
+        try {
+            const result = await seedProductData(env, TARGET_PRINTFUL_PRODUCT_ID, TARGET_COLORS);
+            return new Response(JSON.stringify(result), {
+                headers: { 'Content-Type': 'application/json' },
+                status: result.success ? 200 : 500,
+            });
+        } catch (e) {
+            console.error('Seeding endpoint error:', e);
+            return new Response(JSON.stringify({ success: false, message: e.message }), { status: 500 });
+        }
+    }
+    return new Response('Not Found', { status: 404 });
+  },
+
+  // Add scheduled handler if needed, e.g., for daily updates
+   async scheduled(event, env, ctx) {
+     // Implement daily price/inventory updates here if required
+     console.log(`Scheduled task triggered: ${event.cron}`);
+     // Example: await updateProductVariants(env.DB, env);
+   }
+};
+
+// Helper to ensure updateProductVariants is defined if used in scheduled
+async function updateProductVariants(db, env) {
+    console.log("Running scheduled task to update product variants (price/inventory)...");
+    // Add logic from BACKEND_DAY_2.md's scheduled.js here
+    console.log("Scheduled task finished.");
+}
+
+// Helper function to generate SHA-256 hash (needed for filename generation)
+// Uses the Web Crypto API available in Workers
+async function sha256(message) {
+    const msgUint8 = new TextEncoder().encode(message); // encode as (utf-8) Uint8Array
+    const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8); // hash the message
+    const hashArray = Array.from(new Uint8Array(hashBuffer)); // convert buffer to byte array
+    const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join(''); // convert bytes to hex string
+    return hashHex;
+}
+
+// Helper to upload to R2 and return public URL
+async function uploadToR2(env, productId, filename, arrayBuffer, contentType) {
+    if (!env.R2_BUCKET) {
+        throw new Error('R2_BUCKET environment binding is not configured.');
+    }
+    if (!env.R2_PUBLIC_URL) {
+        throw new Error('R2_PUBLIC_URL environment variable is not set.');
+    }
+
+    const r2Key = `product-templates/${productId}/${filename}`; // Create folder structure
+
+    try {
+        console.log(`Uploading ${r2Key} to R2...`); // Log the full key
+        const options = { httpMetadata: { contentType } };
+        await env.R2_BUCKET.put(r2Key, arrayBuffer, options); // Use r2Key
+        const publicUrl = `${env.R2_PUBLIC_URL.replace(/\/$/, '')}/${r2Key}`; // Use r2Key in public URL
+        console.log(`Uploaded to R2: ${publicUrl}`);
+        return publicUrl;
+    } catch (error) {
+        console.error(`Failed to upload ${r2Key} to R2:`, error);
+        throw new Error(`R2 upload failed for ${r2Key}: ${error.message}`);
+    }
+}
+</file>
+
+<file path="tests/designs.test.js">
+import { describe, expect, it, beforeAll } from 'bun:test';
+import jwt from '@tsndr/cloudflare-worker-jwt'; // For generating test JWT
+import dotenv from 'dotenv';
+import path from 'path';
+
+// Load environment variables from .dev.vars
+dotenv.config({ path: path.resolve(__dirname, '../.dev.vars') });
+
+// Helper function to create a dummy image file Blob for testing
+function createDummyImageFile(filename = 'test.png', type = 'image/png', size = 1024) {
+    const buffer = new ArrayBuffer(size);
+    return new File([buffer], filename, { type });
+}
+
+describe('Designs API Endpoint (Live Dev Server)', () => {
+    let testToken; // JWT for authenticated requests
+    const TEST_FID = 12345; // Example Farcaster ID for testing
+    // Get AUTH_SECRET from environment (loaded from .dev.vars)
+    const AUTH_SECRET = process.env.AUTH_SECRET;
+    let testProductId = 1; // From previous DB query
+    let testVariantId = 1; // From previous DB query
+    const BASE_URL = 'http://localhost:8787'; // Target the running dev server
+    let createdDesignId = null; // Store ID for potential cleanup or further tests
+
+    beforeAll(async () => {
+        if (!AUTH_SECRET) {
+            throw new Error('AUTH_SECRET not found in environment. Make sure it is set in api/.dev.vars');
+        }
+        // Generate a test JWT token, explicitly setting HS256
+        testToken = await jwt.sign({ fid: TEST_FID }, AUTH_SECRET, { algorithm: 'HS256' });
+        console.log(`Using testToken: ${testToken.substring(0, 10)}...`);
+        console.log(`Using test FID: ${TEST_FID}`);
+        console.log(`Using test Product ID: ${testProductId}, Variant ID: ${testVariantId}`);
+    });
+
+    // No worker setup/teardown needed
+    // TODO: Add afterAll to clean up created design?
+
+    it('POST /api/designs should create a design and enqueue mockup task', async () => {
+        const formData = new FormData();
+        formData.append('product_id', testProductId.toString());
+        formData.append('variant_id', testVariantId.toString());
+        formData.append('image', createDummyImageFile('actual_test.png')); // Give a unique name
+
+        const resp = await fetch(`${BASE_URL}/api/designs`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${testToken}`
+                // Content-Type is set automatically by FormData
+            },
+            body: formData,
+        });
+
+        expect(resp.status).toBe(201); // Check for Created status
+        const json = await resp.json();
+        expect(json.success).toBe(true);
+        expect(json.designId).toBeDefined();
+        expect(json.designId).toBeGreaterThan(0);
+        expect(json.imageUrl).toBeDefined();
+        // Check against R2_PUBLIC_URL from env
+        const expectedUrlPrefix = `${process.env.R2_PUBLIC_URL}/user-images/${TEST_FID}/${testProductId}/`;
+        expect(json.imageUrl).toStartWith(expectedUrlPrefix);
+        expect(json.imageUrl).toEndWith('.png');
+
+        createdDesignId = json.designId; // Store for potential later use
+
+        // TODO: Verify DB status - This is hard to do directly from bun:test against wrangler dev.
+        // Option 1: Add a temporary debug endpoint GET /api/designs/:id/status (protected)
+        // Option 2: Check wrangler dev logs for '[DO MockupQueue] Updated status for design X to mockup_pending'
+        // For now, we rely on the 201 status and the DO logs.
+        console.log(`Test check: Design ${createdDesignId} created. Verify 'mockup_pending' status manually via logs or DB query.`);
+    });
+
+    it('POST /api/designs should fail without authentication', async () => {
+        const formData = new FormData();
+        formData.append('product_id', testProductId.toString());
+        formData.append('variant_id', testVariantId.toString());
+        formData.append('image', createDummyImageFile());
+
+        const resp = await fetch(`${BASE_URL}/api/designs`, {
+            method: 'POST',
+            body: formData,
+        });
+        expect(resp.status).toBe(401); // Unauthorized
+        const json = await resp.json();
+        expect(json.error).toContain('Unauthorized');
+    });
+
+    it('POST /api/designs should fail with missing required fields', async () => {
+        const formData = new FormData();
+        // Missing product_id and image
+        formData.append('variant_id', testVariantId.toString());
+
+        const resp = await fetch(`${BASE_URL}/api/designs`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${testToken}`
+            },
+            body: formData,
+        });
+        expect(resp.status).toBe(400); // Bad Request
+        const json = await resp.json();
+        expect(json.success).toBe(false);
+        expect(json.message).toContain('Missing required fields');
+    });
+
+     it('POST /api/designs should fail with invalid variant_id (foreign key)', async () => {
+        const formData = new FormData();
+        formData.append('product_id', testProductId.toString());
+        formData.append('variant_id', '999999'); // Non-existent variant ID
+        formData.append('image', createDummyImageFile());
+
+        const resp = await fetch(`${BASE_URL}/api/designs`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${testToken}`
+            },
+            body: formData,
+        });
+        expect(resp.status).toBe(400); // Bad Request due to FK constraint
+        const json = await resp.json();
+        expect(json.success).toBe(false);
+        expect(json.message).toContain('Invalid product_id or variant_id');
+    });
+
+    // TODO: Add test for GET /api/designs (listing designs for the user)
+});
+</file>
+
+<file path="tests/products.test.js">
+import { describe, it, expect, beforeAll } from 'bun:test';
+
+const API_URL = 'http://localhost:8787'; // Default wrangler dev port
+
+describe('Product API Endpoints', () => {
+    let testTargetDbProductId = null; // The database ID of the product we want to test variants for
+    let fetchedProducts = [];
+
+    // Fetch all products once and find the DB ID for our seeded Printful product
+    beforeAll(async () => {
+        try {
+            const response = await fetch(`${API_URL}/api/products`);
+            expect(response.status).toBe(200); // Expect success here
+            const data = await response.json();
+            fetchedProducts = data.products || [];
+
+            const targetProduct = fetchedProducts.find(p => p.id === 1); // Hardcoding DB ID 1 based on manual check
+
+            if (targetProduct) {
+                testTargetDbProductId = targetProduct.id;
+                console.log(`Found target product with DB ID: ${testTargetDbProductId} for testing variants.`);
+            } else {
+                // If we didn't find DB ID 1, log an error, tests might fail.
+                console.error(`Error: Could not find the seeded product (expected DB ID 1) in the /api/products response.`);
+                // Attempt to use the first product if available, but warn heavily
+                if(fetchedProducts.length > 0) {
+                    testTargetDbProductId = fetchedProducts[0].id;
+                    console.warn(`Falling back to using the first available product DB ID: ${testTargetDbProductId}`);
+                }
+            }
+
+        } catch (error) {
+            console.error('Error during beforeAll product fetch/setup:', error);
+            // Rethrow or handle so tests don't run with bad setup
+            throw new Error(`Test setup failed: ${error.message}`);
+        }
+    });
+
+    describe('GET /api/products', () => {
+        it('should return a list of products with variants', async () => {
+            // Response already fetched and basic structure checked in beforeAll
+            expect(fetchedProducts).toBeInstanceOf(Array);
+
+            // Check structure of the first product if available
+            if (fetchedProducts.length > 0) {
+                const product = fetchedProducts[0];
+                expect(product).toHaveProperty('id');
+                expect(product).toHaveProperty('name');
+                expect(product).toHaveProperty('slug');
+                expect(product).toHaveProperty('variants');
+                expect(Array.isArray(product.variants)).toBe(true);
+
+                // Check structure of the first variant if available
+                if (product.variants.length > 0) {
+                    const variant = product.variants[0];
+                    expect(variant).toHaveProperty('id');
+                    expect(variant).toHaveProperty('color_name');
+                    expect(variant).toHaveProperty('size');
+                    expect(variant).toHaveProperty('inventory_count');
+                }
+            }
+        });
+    });
+
+    describe('GET /api/products/:product_id/variants', () => {
+        it('should return 200 OK and variants for a valid product ID', async () => {
+            if (!testTargetDbProductId) {
+                throw new Error('Cannot run variant test: test setup did not find a target DB product ID.');
+            }
+            const response = await fetch(`${API_URL}/api/products/${testTargetDbProductId}/variants`);
+            expect(response.status).toBe(200);
+
+            const data = await response.json();
+            expect(data).toHaveProperty('variants');
+            expect(Array.isArray(data.variants)).toBe(true);
+
+            // Check structure of the first variant if available
+            if (data.variants.length > 0) {
+                const variant = data.variants[0];
+                 expect(variant).toHaveProperty('id');
+                 expect(variant).toHaveProperty('color_name');
+                 expect(variant).toHaveProperty('size');
+                 expect(variant).toHaveProperty('inventory_count');
+            }
+        });
+
+        it('should return 404 Not Found for a non-existent product ID', async () => {
+            const nonExistentId = 'invalid-db-id-99999'; // Use an ID unlikely to exist in the DB
+            const response = await fetch(`${API_URL}/api/products/${nonExistentId}/variants`);
+            expect(response.status).toBe(404);
+            const data = await response.json();
+            expect(data).toHaveProperty('error');
+            expect(data.error).toContain(`Product with ID ${nonExistentId} not found`);
+        });
+
+        // Hono usually handles routes without params as a 404 Not Found for the parent route
+        // So a specific test for `/api/products//variants` isn't strictly necessary
+        // unless you have specific middleware handling that case.
+    });
+});
+</file>
+
+<file path=".editorconfig">
+# http://editorconfig.org
+root = true
+
+[*]
+indent_style = tab
+end_of_line = lf
+charset = utf-8
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+[*.yml]
+indent_style = space
+</file>
+
+<file path=".prettierrc">
+{
+	"printWidth": 140,
+	"singleQuote": true,
+	"semi": true,
+	"useTabs": true
+}
+</file>
+
+<file path="local_schema.sql">
+âď¸ wrangler 4.14.1
+-------------------
+
+đ Executing on local database fc_swag (42264697-0923-4fbc-8c55-bb904eee9ddf) from .wrangler/state/v3/d1:
+đ To execute on your remote database, add a --remote flag to your wrangler command.
+
+[32mIf you think this is a bug then please create an issue at https://github.com/cloudflare/workers-sdk/issues/new/choose[0m
+? Would you like to report this error to Cloudflare? Wrangler's output and the error details will be shared with the Wrangler team to help us diagnose and fix the issue.
+đ¤ Using fallback value in non-interactive context: no
+</file>
+
+<file path="schema.sql">
+-- Schema based on docs/INITIAL_DB_PLAN.md
+
+-- 1. products Table: Stores each T-shirt style
+CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    printful_product_id INTEGER UNIQUE NOT NULL,  -- The ID from Printful API
+    name TEXT NOT NULL,                           -- e.g., "Unisex Garment-Dyed Heavyweight T-Shirt"
+    slug TEXT UNIQUE NOT NULL,                    -- URL-friendly identifier, e.g., "unisex-heavyweight-tee"
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'inactive', 'archived')),
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Indexes for products table
+CREATE INDEX IF NOT EXISTS idx_products_status ON products(status);
+-- Note: UNIQUE constraint on slug implicitly creates an index
+
+-- 2. product_variants Table: Tracks color variants and inventory
+CREATE TABLE IF NOT EXISTS product_variants (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    printful_variant_id INTEGER UNIQUE NOT NULL, -- The variant ID from Printful API
+    printful_product_id INTEGER NOT NULL,        -- Denormalized for easier lookups if needed
+    color_name TEXT NOT NULL,                    -- e.g., "Black", "Berry"
+    color_code TEXT NOT NULL,                    -- e.g., "#000000", "#8e5a7b"
+    size TEXT NOT NULL,                          -- e.g., "S", "M", "L", "XL"
+    printful_price REAL NOT NULL,                -- Base price from Printful for this variant (USD)
+    inventory_count INTEGER NOT NULL DEFAULT 0,  -- Current stock level
+    status TEXT NOT NULL DEFAULT 'available' CHECK(status IN ('available', 'out_of_stock', 'discontinued')),
+    -- New fields for canvas editor
+    template_image_url TEXT,                     -- URL for the base t-shirt shape/overlay image
+    template_texture_url TEXT,                   -- Optional texture URL for specific variants (like heather)
+    template_width INTEGER,                      -- Width of the template canvas (pixels)
+    template_height INTEGER,                     -- Height of the template canvas (pixels)
+    print_area_width INTEGER,                    -- Width of the printable area (pixels)
+    print_area_height INTEGER,                   -- Height of the printable area (pixels)
+    print_area_top INTEGER,                      -- Top offset of the print area (pixels)
+    print_area_left INTEGER,                     -- Left offset of the print area (pixels)
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Indexes for product_variants table
+CREATE INDEX IF NOT EXISTS idx_variants_product ON product_variants(product_id);
+
+-- Trigger to update 'updated_at' timestamp on products table changes
+CREATE TRIGGER products_update_timestamp
+AFTER UPDATE ON products
+FOR EACH ROW
+BEGIN
+    UPDATE products SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
+END;
+
+-- Trigger to update 'updated_at' timestamp on product_variants table changes
+CREATE TRIGGER product_variants_update_timestamp
+AFTER UPDATE ON product_variants
+FOR EACH ROW
+BEGIN
+    UPDATE product_variants SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
+END;
+
+-- Designs Table: Stores user-created designs.
+CREATE TABLE designs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fid INTEGER NOT NULL,                       -- Farcaster ID of the creator
+    product_id INTEGER NOT NULL,                -- FK to products table
+    variant_id INTEGER NOT NULL,                -- FK to product_variants table
+    image_url TEXT NOT NULL,                    -- URL of the user-uploaded, transformed image stored in R2
+    mockup_url TEXT,                            -- URL of the generated Printful mockup
+    is_public BOOLEAN NOT NULL DEFAULT FALSE,   -- Whether the design is published and visible
+    published_at DATETIME,                      -- Timestamp when the design was published
+    royalty_percent INTEGER CHECK(royalty_percent >= 15 AND royalty_percent <= 30), -- Artist's royalty (15-30%)
+    retail_price REAL,                          -- Calculated retail price at publish time
+    artist_earn REAL,                           -- Calculated artist earnings per sale
+    status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft', 'mockup_generating', 'mockup_ready', 'published', 'error')),
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (product_id) REFERENCES products (id),
+    FOREIGN KEY (variant_id) REFERENCES product_variants (id)
+);
+
+-- Index for faster lookups by FID
+CREATE INDEX idx_designs_fid ON designs (fid);
+-- Index for public feed
+CREATE INDEX idx_designs_public_published ON designs (is_public, published_at DESC) WHERE is_public = TRUE;
+
+-- Trigger to update 'updated_at' timestamp on designs table changes
+CREATE TRIGGER designs_update_timestamp
+AFTER UPDATE ON designs
+FOR EACH ROW
+BEGIN
+    UPDATE designs SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
+END;
+</file>
+
+<file path="wrangler.toml">
+name = "fc-swag-api"
+main = "src/index.js"
+compatibility_date = "2025-05-02"
+
+# Enable Node.js compatibility APIs
+compatibility_flags = ["nodejs_compat"]
+
+# Variables and Secrets
+[vars]
+# Define non-secret variables here
+# EXAMPLE_VAR = "example_value"
+
+# Secrets are managed via `wrangler secret put <name>`
+# Required secrets: PRINTFUL_API_KEY, AUTH_SECRET
+
+# D1 Database binding
+[[d1_databases]]
+binding = "DB"                 # i.e. env.DB
+database_name = "fc_swag"
+database_id = "42264697-0923-4fbc-8c55-bb904eee9ddf"
+
+# R2 Bucket binding
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "swag-images"
+
+# Durable Object bindings
+[[migrations]]
+tag = "v1" # Should be unique for each entry
+new_classes = ["SessionDurableObject", "MockupQueueDurableObject"]
+
+[durable_objects]
+bindings = [
+  { name = "SESSION_DO", class_name = "SessionDurableObject" },
+  { name = "MOCKUP_QUEUE_DO", class_name = "MockupQueueDurableObject" }
+]
+
+# Environment-specific settings (optional)
+# [env.production]
+# name = "fc-swag-api-prod"
+
+# Scheduled Task Configuration
+[triggers]
+# Cron format: <Minute> <Hour> <Day_of_Month> <Month> <Day_of_Week>
+# Example: Run daily at midnight UTC
+crons = ["0 0 * * *"]
+</file>
+
+<file path=".gitignore">
+# Logs
+
+logs
+_.log
+npm-debug.log_
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+.pnpm-debug.log*
+
+# Diagnostic reports (https://nodejs.org/api/report.html)
+
+report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
+
+# Runtime data
+
+pids
+_.pid
+_.seed
+\*.pid.lock
+
+# Directory for instrumented libs generated by jscoverage/JSCover
+
+lib-cov
+
+# Coverage directory used by tools like istanbul
+
+coverage
+\*.lcov
+
+# nyc test coverage
+
+.nyc_output
+
+# Grunt intermediate storage (https://gruntjs.com/creating-plugins#storing-task-files)
+
+.grunt
+
+# Bower dependency directory (https://bower.io/)
+
+bower_components
+
+# node-waf configuration
+
+.lock-wscript
+
+# Compiled binary addons (https://nodejs.org/api/addons.html)
+
+build/Release
+
+# Dependency directories
+
+node_modules/
+jspm_packages/
+
+# Snowpack dependency directory (https://snowpack.dev/)
+
+web_modules/
+
+# TypeScript cache
+
+\*.tsbuildinfo
+
+# Optional npm cache directory
+
+.npm
+
+# Optional eslint cache
+
+.eslintcache
+
+# Optional stylelint cache
+
+.stylelintcache
+
+# Microbundle cache
+
+.rpt2_cache/
+.rts2_cache_cjs/
+.rts2_cache_es/
+.rts2_cache_umd/
+
+# Optional REPL history
+
+.node_repl_history
+
+# Output of 'npm pack'
+
+\*.tgz
+
+# Yarn Integrity file
+
+.yarn-integrity
+
+# dotenv environment variable files
+
+.env
+.env.development.local
+.env.test.local
+.env.production.local
+.env.local
+
+# parcel-bundler cache (https://parceljs.org/)
+
+.cache
+.parcel-cache
+
+# Next.js build output
+
+.next
+out
+
+# Nuxt.js build / generate output
+
+.nuxt
+dist
+
+# Gatsby files
+
+.cache/
+
+# Comment in the public line in if your project uses Gatsby and not Next.js
+
+# https://nextjs.org/blog/next-9-1#public-directory-support
+
+# public
+
+# vuepress build output
+
+.vuepress/dist
+
+# vuepress v2.x temp and cache directory
+
+.temp
+.cache
+
+# Docusaurus cache and generated files
+
+.docusaurus
+
+# Serverless directories
+
+.serverless/
+
+# FuseBox cache
+
+.fusebox/
+
+# DynamoDB Local files
+
+.dynamodb/
+
+# TernJS port file
+
+.tern-port
+
+# Stores VSCode versions used for testing VSCode extensions
+
+.vscode-test
+
+# yarn v2
+
+.yarn/cache
+.yarn/unplugged
+.yarn/build-state.yml
+.yarn/install-state.gz
+.pnp.\*
+
+# wrangler project
+
+.dev.vars
+.wrangler/
+</file>
+
+<file path="package.json">
+{
+	"name": "fc-swag-api",
+	"version": "0.0.0",
+	"private": true,
+	"scripts": {
+		"deploy": "wrangler deploy",
+		"dev": "wrangler dev",
+		"start": "wrangler dev"
+	},
+	"dependencies": {
+		"@farcaster/auth-client": "^0.3.0",
+		"@tsndr/cloudflare-worker-jwt": "^3.1.4",
+		"hono": "^3.0.0",
+		"viem": "^2.28.3"
+	},
+	"devDependencies": {
+		"wrangler": "^4.14.1"
+	}
+}
+</file>
+
+</files>
