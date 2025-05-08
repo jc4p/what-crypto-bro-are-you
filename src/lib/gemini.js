@@ -125,8 +125,8 @@ export async function analyzeCryptoBroType(bio, casts) {
 
 **Input Data:**
 Bio: ${bio || 'No bio provided.'}
-Recent Casts (max ${casts.length > 50 ? 50 : casts.length}):
-${casts.slice(0, 50).join('\\n---\\n')} ${casts.length > 50 ? '\\n[... additional casts truncated]' : ''}
+Recent Casts (max ${casts.length > 500 ? 500 : casts.length}):
+${casts.slice(0, 500).join('\\n---\\n')} ${casts.length > 500 ? '\\n[... additional casts truncated]' : ''}
 
 **Analysis Instructions:**
 1.  **Affinity:** Estimate affinity for BOTH personas (0-100%). These do not need to sum to 100.
